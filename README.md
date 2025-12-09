@@ -208,6 +208,18 @@ Output (digit class probabilities)
 - **Batch Size**: 32
 - **Expected Accuracy**: ~98%
 
+## 🎬 Demo & Screenshots
+
+### 1. Draw & Predict Digits
+![Drawing Interface](assets/images/demo-drawing.png)
+*Real-time handwritten digit recognition with confidence scores*
+
+### 2. Handwriting Calculator
+![Calculator Interface](assets/images/demo-calculator.png)
+*Build math expressions by drawing digits and clicking operators*
+
+---
+
 ## 🛠️ Troubleshooting
 
 ### "Model file not found"
