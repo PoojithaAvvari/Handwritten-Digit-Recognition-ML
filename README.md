@@ -211,11 +211,11 @@ Output (digit class probabilities)
 ## 🎬 Demo & Screenshots
 
 ### 1. Draw & Predict Digits
-![Drawing Interface](assets/images/demo-drawing.png)
+![Drawing Interface](assets/images/screenshot1.png)
 *Real-time handwritten digit recognition with confidence scores*
 
 ### 2. Handwriting Calculator
-![Calculator Interface](assets/images/demo-calculator.png)
+![Calculator Interface](assets/images/screenshot2.png)
 *Build math expressions by drawing digits and clicking operators*
 
 ---
