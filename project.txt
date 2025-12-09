@@ -1,0 +1,3911 @@
+# app.py
+import os
+import io
+import base64
+import numpy as np
+from PIL import Image, ImageOps, ImageFilter
+from flask import Flask, render_template, request, jsonify
+
+import tensorflow as tf
+from tensorflow.keras import models
+
+# -----------------------------
+# Config
+# -----------------------------
+MODEL_PATH = "trained_model.h5"   # change if needed
+DEFAULT_THRESHOLD = 0.70
+APPLY_SMOOTHING = True            # server-side smoothing (Gaussian blur) to help handwriting
+
+app = Flask(__name__)
+
+# -----------------------------
+# Load model (prediction-only)
+# -----------------------------
+model = None
+model_load_error = None
+
+def try_load_model(path):
+    global model, model_load_error
+    if not os.path.exists(path):
+        model_load_error = f"Model file not found at '{path}'. Please place a trained model there."
+        print("[WARN]", model_load_error)
+        model = None
+        return
+
+    try:
+        model = models.load_model(path, compile=False)
+        model_load_error = None
+        print(f"[INFO] Loaded model from {path}")
+    except Exception as e:
+        model = None
+        model_load_error = f"Failed to load model: {e}"
+        print("[ERROR]", model_load_error)
+
+try_load_model(MODEL_PATH)
+
+
+# -----------------------------
+# Preprocessing utilities
+# -----------------------------
+def center_and_resize_to_28(img_L_inverted: Image.Image) -> Image.Image:
+    arr = np.array(img_L_inverted)
+    rows = np.where(arr.max(axis=1) > 0)[0]
+    cols = np.where(arr.max(axis=0) > 0)[0]
+
+    if rows.size and cols.size:
+        r0, r1 = rows[0], rows[-1] + 1
+        c0, c1 = cols[0], cols[-1] + 1
+        arr = arr[r0:r1, c0:c1]
+
+    if arr.size == 0:
+        return Image.new('L', (28, 28), 0)
+
+    h, w = arr.shape
+    if h > w:
+        new_h, new_w = 20, max(1, int(round(20 * w / h)))
+    else:
+        new_w, new_h = 20, max(1, int(round(20 * h / w)))
+
+    digit = Image.fromarray(arr).resize((new_w, new_h), Image.LANCZOS)
+    canvas = Image.new('L', (28, 28), 0)
+    left = (28 - new_w) // 2
+    top = (28 - new_h) // 2
+    canvas.paste(digit, (left, top))
+    return canvas
+
+def preprocess_pil_to_tensor(img: Image.Image, apply_smoothing: bool = True) -> np.ndarray:
+    """
+    Convert PIL image to MNIST-like tensor:
+      - grayscale
+      - optional smoothing (Gaussian blur) to reduce stroke noise
+      - invert (white digit on black)
+      - center+resize to 28x28
+      - normalize and reshape to (1,28,28,1)
+    """
+    img = img.convert("L")
+    if apply_smoothing:
+        # small blur helps thin strokes and reduces jitter
+        img = img.filter(ImageFilter.GaussianBlur(radius=0.9))
+    img = ImageOps.invert(img)
+    img = center_and_resize_to_28(img)
+    arr = np.array(img).astype("float32") / 255.0
+    arr = arr.reshape(1, 28, 28, 1)
+    return arr
+
+def predict_with_confidence_pil(img: Image.Image, threshold: float, smoothing: bool):
+    if model is None:
+        raise RuntimeError(model_load_error or "Model not loaded.")
+    tensor = preprocess_pil_to_tensor(img, apply_smoothing=smoothing)
+    probs = model.predict(tensor, verbose=0)[0]
+    label = int(np.argmax(probs))
+    conf = float(np.max(probs))
+    is_sure = conf >= threshold
+    return label, conf, is_sure, probs.tolist()
+
+# -----------------------------
+# Routes
+# -----------------------------
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/model_status", methods=["GET"])
+def model_status():
+    if model is None:
+        return jsonify({"loaded": False, "error": model_load_error})
+    return jsonify({"loaded": True, "model_path": MODEL_PATH})
+
+@app.route("/predict_draw", methods=["POST"])
+def predict_draw():
+    """
+    Body JSON: { image: "data:image/png;base64,...", threshold: 0.7?, smoothing: true|false? }
+    """
+    try:
+        if model is None:
+            return jsonify({"error": model_load_error or "Model is not loaded."}), 400
+
+        data = request.get_json(force=True)
+        data_url = data.get("image")
+        threshold = float(data.get("threshold", DEFAULT_THRESHOLD))
+        smoothing = bool(data.get("smoothing", APPLY_SMOOTHING))
+
+        header, b64data = data_url.split(",", 1)
+        img_bytes = base64.b64decode(b64data)
+        img = Image.open(io.BytesIO(img_bytes))
+
+        label, conf, is_sure, probs = predict_with_confidence_pil(img, threshold, smoothing)
+        return jsonify({
+            "digit": None if not is_sure else label,
+            "raw_digit": label,
+            "confidence": conf,
+            "is_sure": is_sure,
+            "probs": probs
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/predict_files", methods=["POST"])
+def predict_files():
+    try:
+        if model is None:
+            return jsonify({"error": model_load_error or "Model not loaded."}), 400
+
+        threshold = float(request.form.get("threshold", DEFAULT_THRESHOLD))
+        smoothing = request.form.get("smoothing", str(APPLY_SMOOTHING)).lower() in ("1","true","yes")
+        files = request.files.getlist("files")
+        results = []
+        for f in files:
+            img = Image.open(f.stream)
+            label, conf, is_sure, probs = predict_with_confidence_pil(img, threshold, smoothing)
+            results.append({
+                "filename": f.filename,
+                "digit": None if not is_sure else label,
+                "raw_digit": label,
+                "confidence": conf,
+                "is_sure": is_sure,
+                "probs": probs
+            })
+        return jsonify({"results": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    
+@app.route("/evaluate_expression", methods=["POST"])
+def evaluate_expression():
+    try:
+        data = request.get_json(force=True)
+        expr = data.get("expression", "")
+        
+        # sanitize input: only allow digits, + - * / ( ) and **
+        allowed_chars = "0123456789+-*/() "
+        if not all(ch in allowed_chars for ch in expr.replace("**", "")):
+            return jsonify({"error": "Invalid characters in expression"}), 400
+
+        result = eval(expr)  # safe after sanitization
+        return jsonify({"expression": expr, "result": result})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+    
+if __name__ == "__main__":
+    print("[INFO] Starting Flask app (prediction-only).")
+    app.run(debug=True)
+
+
+
+---------------------------------------------------------------
+/* static/style.css (full CSS) */
+:root {
+  --bg: #ffffff;
+  --fg: #111827;
+  --muted: #6b7280;
+  --card: #f9fafb;
+  --accent: #2563eb;
+  --accent-contrast: #ffffff;
+  --border: #e5e7eb;
+}
+:root[data-theme="dark"] {
+  --bg: #0b0f19;
+  --fg: #e5e7eb;
+  --muted: #9ca3af;
+  --card: #111827;
+  --accent: #60a5fa;
+  --accent-contrast: #0b0f19;
+  --border: #1f2937;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+header, footer {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 16px 20px;
+}
+header { display:flex; align-items:center; justify-content:space-between; }
+h1 { margin:0; font-size:1.4rem; }
+h2 { margin:0 0 12px; }
+.hint { margin: 6px 0 12px; color: var(--muted); }
+
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 8px 20px 40px;
+  display: grid;
+  gap: 16px;
+  grid-template-columns: 1fr 1fr;
+}
+@media (max-width: 960px){ main{ grid-template-columns:1fr; } }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 16px;
+  box-shadow: 0 2px 10px rgb(0 0 0 / 6%);
+}
+
+.canvas-row { display:flex; gap:16px; align-items:flex-start; }
+canvas {
+  border: 2px dashed var(--border);
+  border-radius: 12px;
+  background: #ffffff;
+  width: 280px; height: 280px;
+  touch-action: none;
+}
+
+.canvas-buttons { display:flex; flex-direction:column; gap:8px; }
+.row { display:flex; gap:12px; align-items:center; }
+small { font-size: 0.85rem; color: var(--muted); }
+
+button {
+  appearance: none; border: none;
+  background: var(--accent); color: var(--accent-contrast);
+  padding: 8px 12px; border-radius: 10px; font-weight: 600; cursor: pointer;
+}
+button[disabled]{ opacity: .6; cursor: default; }
+
+input[type="number"]{
+  width: 120px; padding: 6px 8px; border-radius: 8px; border:1px solid var(--border);
+  background: var(--bg); color: var(--fg);
+}
+input[type="file"]{ display:block; margin:8px 0 10px; }
+
+.result .big{ font-size: 40px; font-weight: 800; margin-bottom: 6px; }
+.pred{
+  background: rgba(0,0,0,0.04); padding:10px; border-radius:12px; border:1px solid var(--border);
+}
+:root[data-theme="dark"] .pred { background: rgba(255,255,255,0.05); }
+
+.grid {
+  display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+}
+.grid-item{
+  display:grid; grid-template-columns: 90px 1fr; gap:10px;
+  background: var(--bg); border:1px solid var(--border);
+  border-radius:12px; padding:10px;
+}
+.thumb{ width:90px; height:90px; border-radius:8px; overflow:hidden; display:flex; align-items:center; justify-content:center; background:#fff; border:1px dashed var(--border); }
+.thumb img{ max-width:100%; max-height:100%; }
+.meta .fn{ font-weight:600; margin-bottom:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.predline{ color: var(--muted); }
+
+.error{
+  color:#ef4444; font-weight:600; padding:8px 10px;
+  background: rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.2); border-radius:10px;
+}
+
+/* Modal */
+.modal { position: fixed; inset: 0; display:flex; align-items:center; justify-content:center; background: rgba(0,0,0,0.5); z-index: 2000; }
+.modal.hidden { display: none; }
+.modal-content {
+  background: var(--card); padding: 12px; border-radius: 12px; max-width: 90vw; max-height: 90vh; overflow: auto;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+  position: relative;
+}
+.modal img { max-width: 80vw; max-height: 70vh; display:block; margin: 0 auto; }
+.modal-close { position:absolute; right:8px; top:8px; background:transparent; border:none; font-size:18px; cursor:pointer; }
+
+/* Theme switcher */
+.switch { position: relative; display: inline-block; width: 52px; height: 28px; }
+.switch input { display:none; }
+.slider { position: absolute; cursor: pointer; inset:0; background:#ccc; transition:.2s; border-radius:28px; }
+.slider:before { content:""; position:absolute; height:22px; width:22px; left:3px; bottom:3px; background:#fff; transition:.2s; border-radius:50%; }
+input:checked + .slider { background: var(--accent); }
+input:checked + .slider:before { transform: translateX(24px); }
+style.css
+---------------------------------------------------
+app.js
+
+// static/app.js
+// Handles drawing, canvas predict, gallery, uploads, modal preview
+
+// Theme
+const themeToggle = document.getElementById('themeToggle');
+const themeLabel = document.getElementById('themeLabel');
+function setTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  themeLabel.textContent = t[0].toUpperCase() + t.slice(1);
+  localStorage.setItem('theme', t);
+  themeToggle.checked = (t === 'dark');
+}
+setTheme(localStorage.getItem('theme') || 'light');
+themeToggle.addEventListener('change', () => setTheme(themeToggle.checked ? 'dark' : 'light'));
+
+// Canvas
+const canvas = document.getElementById('drawCanvas');
+const ctx = canvas.getContext('2d');
+canvas.width = 280; canvas.height = 280;
+function resetCanvas() {
+  ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.strokeStyle = '#000000'; ctx.lineWidth = 20; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+}
+resetCanvas();
+
+let drawing=false, lastX=0, lastY=0;
+function getPos(e){
+  const rect = canvas.getBoundingClientRect();
+  const isTouch = e.touches && e.touches.length;
+  const clientX = isTouch ? e.touches[0].clientX : e.clientX;
+  const clientY = isTouch ? e.touches[0].clientY : e.clientY;
+  return { x: clientX - rect.left, y: clientY - rect.top };
+}
+function startDraw(e){ e.preventDefault(); drawing=true; const p=getPos(e); lastX=p.x; lastY=p.y; }
+function moveDraw(e){ if(!drawing) return; e.preventDefault(); const p=getPos(e); ctx.beginPath(); ctx.moveTo(lastX,lastY); ctx.lineTo(p.x,p.y); ctx.stroke(); lastX=p.x; lastY=p.y; }
+function endDraw(e){ if(!drawing) return; e.preventDefault(); drawing=false; ctx.beginPath(); }
+
+canvas.addEventListener('mousedown', startDraw);
+canvas.addEventListener('mousemove', moveDraw);
+canvas.addEventListener('mouseup', endDraw);
+canvas.addEventListener('mouseleave', endDraw);
+canvas.addEventListener('touchstart', startDraw, {passive:false});
+canvas.addEventListener('touchmove', moveDraw, {passive:false});
+canvas.addEventListener('touchend', endDraw);
+
+// Buttons
+document.getElementById('clearBtn').addEventListener('click', () => { resetCanvas(); document.getElementById('drawResult').innerHTML=''; });
+document.getElementById('downloadBtn').addEventListener('click', () => {
+  const a = document.createElement('a'); a.href = canvas.toDataURL('image/png'); a.download='digit.png'; a.click();
+});
+
+// Predict canvas
+document.getElementById('predictBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('predictBtn');
+  btn.disabled=true; btn.textContent='Predicting...';
+  try {
+    const threshold = parseFloat(document.getElementById('threshold').value || '0.7');
+    const smoothing = document.getElementById('smoothing').checked;
+    const dataURL = canvas.toDataURL('image/png');
+    const res = await fetch('/predict_draw', {
+      method:'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ image: dataURL, threshold, smoothing })
+    });
+    const data = await res.json();
+    const out = document.getElementById('drawResult');
+    if (data.error) {
+      out.innerHTML = `<div class="error">Error: ${data.error}</div>`;
+    } else {
+      const pct = (data.confidence*100).toFixed(1);
+      const shown = data.is_sure ? data.raw_digit : 'Not Sure';
+      out.innerHTML = `<div class="pred"><div class="big">${shown}</div><div>Confidence: ${pct}%</div><details><summary>Class probs</summary><pre>${JSON.stringify(data.probs,null,2)}</pre></details></div>`;
+    }
+  } catch (e) {
+    document.getElementById('drawResult').innerHTML = `<div class="error">Error: ${e}</div>`;
+  } finally {
+    btn.disabled=false; btn.textContent='Predict';
+  }
+});
+
+// Save to gallery (localStorage)
+const GALLERY_KEY = 'digit_gallery_v1';
+function loadGallery(){ try { return JSON.parse(localStorage.getItem(GALLERY_KEY) || '[]'); } catch(e){ return []; } }
+function saveGallery(arr){ localStorage.setItem(GALLERY_KEY, JSON.stringify(arr)); }
+function renderGallery(){
+  const gallery = document.getElementById('gallery');
+  gallery.innerHTML = '';
+  const items = loadGallery();
+  items.forEach((dataURL, idx) => {
+    const div = document.createElement('div'); div.className='grid-item';
+    div.innerHTML = `<div class="thumb"><img id="gimg-${idx}"></div><div class="meta"><div class="fn">Saved ${idx+1}</div><div class="predline"><button data-idx="${idx}" class="openBtn">Open</button></div></div>`;
+    gallery.appendChild(div);
+    const img = document.getElementById(`gimg-${idx}`);
+    img.src = dataURL;
+  });
+}
+document.getElementById('saveGalleryBtn').addEventListener('click', () => {
+  const dataURL = canvas.toDataURL('image/png');
+  const items = loadGallery();
+  items.unshift(dataURL); // newest first
+  if (items.length > 50) items.pop();
+  saveGallery(items);
+  renderGallery();
+});
+document.getElementById('clearGallery').addEventListener('click', () => { localStorage.removeItem(GALLERY_KEY); renderGallery(); });
+
+// Modal preview
+const modal = document.getElementById('modal');
+const modalImg = document.getElementById('modalImg');
+const modalClose = document.getElementById('modalClose');
+const modalDownload = document.getElementById('modalDownload');
+
+function openModalWithSrc(src){
+  modalImg.src = src;
+  modal.classList.remove('hidden');
+  modalDownload.onclick = () => { const a=document.createElement('a'); a.href=src; a.download='image.png'; a.click(); };
+}
+modalClose.addEventListener('click', ()=> modal.classList.add('hidden'));
+modal.addEventListener('click', (e) => { if (e.target === modal) modal.classList.add('hidden'); });
+
+// open buttons delegate
+document.body.addEventListener('click', (e) => {
+  if (e.target.classList.contains('openBtn')) {
+    const idx = parseInt(e.target.dataset.idx, 10);
+    const items = loadGallery();
+    openModalWithSrc(items[idx]);
+  }
+});
+
+// Upload & predict files (grid + popup on click)
+document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const grid = document.getElementById('grid'); grid.innerHTML='';
+  const files = document.getElementById('files').files;
+  if (!files.length) return;
+  const threshold = parseFloat(document.getElementById('thresholdUpload').value || '0.7');
+  const smoothing = document.getElementById('smoothingUpload').checked;
+  const fd = new FormData();
+  for (const f of files) fd.append('files', f);
+  fd.append('threshold', threshold);
+  fd.append('smoothing', smoothing ? 'true' : 'false');
+
+  const res = await fetch('/predict_files', { method:'POST', body: fd });
+  const data = await res.json();
+  if (data.error) { grid.innerHTML = `<div class="error">Error: ${data.error}</div>`; return; }
+  data.results.forEach((item, idx) => {
+    const pct = (item.confidence*100).toFixed(1);
+    const label = item.is_sure ? item.raw_digit : 'Not Sure';
+    const card = document.createElement('div'); card.className='grid-item';
+    card.innerHTML = `<div class="thumb"><img id="upimg-${idx}" alt=""></div><div class="meta"><div class="fn" title="${item.filename}">${item.filename}</div><div class="predline"><strong>${label}</strong> — ${pct}%</div><details><summary>Probs</summary><pre>${JSON.stringify(item.probs,null,2)}</pre></details></div>`;
+    grid.appendChild(card);
+  });
+  // show thumbnails
+  [...files].forEach((f, idx) => {
+    const url = URL.createObjectURL(f);
+    const img = document.getElementById(`upimg-${idx}`);
+    img.src = url;
+    img.addEventListener('click', () => openModalWithSrc(url));
+    img.onload = () => URL.revokeObjectURL(url);
+  });
+});
+
+// initial render
+renderGallery();
+// Calculator canvas
+const calcCanvas = document.getElementById('calcCanvas');
+const calcCtx = calcCanvas.getContext('2d');
+calcCanvas.width = 280; calcCanvas.height = 280;
+function resetCalcCanvas() {
+  calcCtx.fillStyle = '#ffffff';
+  calcCtx.fillRect(0,0,calcCanvas.width,calcCanvas.height);
+  calcCtx.strokeStyle = '#000000';
+  calcCtx.lineWidth = 20;
+  calcCtx.lineCap = 'round';
+  calcCtx.lineJoin = 'round';
+}
+resetCalcCanvas();
+
+let calcDrawing = false, calcLastX=0, calcLastY=0;
+function calcGetPos(e){ const r = calcCanvas.getBoundingClientRect(); const x=(e.touches?e.touches[0].clientX:e.clientX)-r.left; const y=(e.touches?e.touches[0].clientY:e.clientY)-r.top; return {x,y}; }
+function calcStart(e){ e.preventDefault(); calcDrawing=true; const p=calcGetPos(e); calcLastX=p.x; calcLastY=p.y; }
+function calcMove(e){ if(!calcDrawing) return; e.preventDefault(); const p=calcGetPos(e); calcCtx.beginPath(); calcCtx.moveTo(calcLastX,calcLastY); calcCtx.lineTo(p.x,p.y); calcCtx.stroke(); calcLastX=p.x; calcLastY=p.y; }
+function calcEnd(e){ if(!calcDrawing) return; e.preventDefault(); calcDrawing=false; calcCtx.beginPath(); }
+
+calcCanvas.addEventListener('mousedown', calcStart);
+calcCanvas.addEventListener('mousemove', calcMove);
+calcCanvas.addEventListener('mouseup', calcEnd);
+calcCanvas.addEventListener('mouseleave', calcEnd);
+calcCanvas.addEventListener('touchstart', calcStart, {passive:false});
+calcCanvas.addEventListener('touchmove', calcMove, {passive:false});
+calcCanvas.addEventListener('touchend', calcEnd);
+
+document.getElementById('calcClearBtn').addEventListener('click', () => { resetCalcCanvas(); });
+
+// Add digit/operator
+document.getElementById('calcAddBtn').addEventListener('click', async () => {
+  const dataURL = calcCanvas.toDataURL('image/png');
+  const threshold = parseFloat(document.getElementById('threshold').value || '0.7');
+  const smoothing = document.getElementById('smoothing').checked;
+  
+  const res = await fetch('/predict_draw', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ image: dataURL, threshold, smoothing })
+  });
+  const data = await res.json();
+  
+  if (data.error) {
+    alert("Prediction error: " + data.error);
+    return;
+  }
+
+  let symbol = data.is_sure ? String(data.raw_digit) : "";
+  // TODO: Extend to handle + - * / operators (train model or map)
+  
+  const exprInput = document.getElementById('calcExpr');
+  exprInput.value += symbol;
+  resetCalcCanvas();
+});
+
+// Evaluate expression
+document.getElementById('calcEvalBtn').addEventListener('click', async () => {
+  const expr = document.getElementById('calcExpr').value;
+  const res = await fetch('/evaluate_expression', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ expression: expr })
+  });
+  const data = await res.json();
+  
+  const out = document.getElementById('calcResult');
+  if (data.error) {
+    out.innerHTML = `<div class="error">${data.error}</div>`;
+  } else {
+    out.innerHTML = `<div class="pred"><div class="big">${data.result}</div><div>from ${data.expression}</div></div>`;
+  }
+});
+------------------------
+index.html<!-- <!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Digit Recognizer</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>🧠 Handwritten Digit Recognizer</h1>
+  <div class="controls">
+    <label class="switch">
+      <input id="themeToggle" type="checkbox">
+      <span class="slider"></span>
+    </label>
+    <span id="themeLabel">Light</span>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Draw a Digit</h2>
+    <div class="canvas-row">
+      <canvas id="drawCanvas" width="280" height="280"></canvas>
+      <div class="canvas-buttons">
+        <div class="threshold-row">
+          <label>Confidence threshold:
+            <input id="threshold" type="number" min="0" max="1" step="0.01" value="0.7">
+          </label>
+        </div>
+        <button id="clearBtn" type="button">Clear</button>
+        <button id="predictBtn" type="button">Predict</button>
+      </div>
+    </div>
+    <div id="drawResult" class="result"></div>
+  </section>
+
+  <section class="card">
+    <h2>Upload Multiple Images</h2>
+    <form id="uploadForm">
+      <input id="files" type="file" accept="image/*" multiple />
+      <div class="threshold-row small">
+        <label>Confidence threshold:
+          <input id="thresholdUpload" type="number" min="0" max="1" step="0.01" value="0.7">
+        </label>
+      </div>
+      <button type="submit">Predict All</button>
+    </form>
+    <div id="grid" class="grid"></div>
+  </section>
+</main>
+
+<footer>
+  <p>Tip: Draw big, centered digits. The app centers and inverts to match MNIST.</p>
+</footer>
+
+<script>
+  // ------------- Theme -------------
+  const themeToggle = document.getElementById('themeToggle');
+  const themeLabel = document.getElementById('themeLabel');
+
+  function setTheme(theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+    themeLabel.textContent = theme.charAt(0).toUpperCase() + theme.slice(1);
+    localStorage.setItem('theme', theme);
+    themeToggle.checked = (theme === 'dark');
+  }
+  setTheme(localStorage.getItem('theme') || 'light');
+  themeToggle.addEventListener('change', () => setTheme(themeToggle.checked ? 'dark' : 'light'));
+
+  // ------------- Canvas -------------
+  const canvas = document.getElementById('drawCanvas');
+  const ctx = canvas.getContext('2d');
+
+  function resetCanvas() {
+    ctx.fillStyle = '#ffffff';       // white background
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = '#000000';     // black ink
+    ctx.lineWidth = 20;
+    ctx.lineCap = 'round';
+  }
+  resetCanvas();
+
+  let drawing = false;
+  function getPos(e) {
+    const r = canvas.getBoundingClientRect();
+    const x = (e.touches ? e.touches[0].clientX : e.clientX) - r.left;
+    const y = (e.touches ? e.touches[0].clientY : e.clientY) - r.top;
+    return { x, y };
+  }
+  function startDraw(e){ drawing = true; const {x,y}=getPos(e); ctx.beginPath(); ctx.moveTo(x,y); }
+  function moveDraw(e){ if(!drawing) return; const {x,y}=getPos(e); ctx.lineTo(x,y); ctx.stroke(); }
+  function endDraw(){ drawing = false; ctx.beginPath(); }
+
+  canvas.addEventListener('mousedown', startDraw);
+  canvas.addEventListener('mousemove', moveDraw);
+  canvas.addEventListener('mouseup', endDraw);
+  canvas.addEventListener('mouseleave', endDraw);
+  canvas.addEventListener('touchstart', startDraw, {passive:true});
+  canvas.addEventListener('touchmove', moveDraw, {passive:true});
+  canvas.addEventListener('touchend', endDraw);
+
+  document.getElementById('clearBtn').addEventListener('click', () => {
+    resetCanvas();
+    document.getElementById('drawResult').innerHTML = '';
+  });
+
+  // ------------- Predict (Canvas) -------------
+  document.getElementById('predictBtn').addEventListener('click', async () => {
+    const btn = document.getElementById('predictBtn');
+    btn.disabled = true; btn.textContent = 'Predicting...';
+    try {
+      const threshold = parseFloat(document.getElementById('threshold').value || '0.7');
+      const dataURL = canvas.toDataURL('image/png');
+      const resp = await fetch('/predict_draw', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ image: dataURL, threshold })
+      });
+      const data = await resp.json();
+      const out = document.getElementById('drawResult');
+
+      if (data.error) {
+        out.innerHTML = `<div class="error">Error: ${data.error}</div>`;
+      } else {
+        const pct = (data.confidence * 100).toFixed(1);
+        const shown = data.is_sure ? data.raw_digit : 'Not Sure';
+        out.innerHTML = `
+          <div class="pred">
+            <div class="big">${shown}</div>
+            <div>Confidence: ${pct}%</div>
+            <details><summary>Class probabilities</summary>
+              <pre>${JSON.stringify(data.probs, null, 2)}</pre>
+            </details>
+          </div>`;
+      }
+    } catch (e) {
+      document.getElementById('drawResult').innerHTML = `<div class="error">Error: ${e}</div>`;
+    } finally {
+      btn.disabled = false; btn.textContent = 'Predict';
+    }
+  });
+
+  // ------------- Predict (Multi-upload) -------------
+  document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const grid = document.getElementById('grid');
+    grid.innerHTML = '';
+
+    const files = document.getElementById('files').files;
+    if (!files.length) return;
+
+    const threshold = parseFloat(document.getElementById('thresholdUpload').value || '0.7');
+    const formData = new FormData();
+    for (const f of files) formData.append('files', f);
+    formData.append('threshold', threshold);
+
+    const resp = await fetch('/predict_files', { method: 'POST', body: formData });
+    const data = await resp.json();
+
+    if (data.error) {
+      grid.innerHTML = `<div class="error">Error: ${data.error}</div>`;
+      return;
+    }
+
+    data.results.forEach((item, idx) => {
+      const pct = (item.confidence * 100).toFixed(1);
+      const label = item.is_sure ? item.raw_digit : 'Not Sure';
+      const card = document.createElement('div');
+      card.className = 'grid-item';
+      card.innerHTML = `
+        <div class="thumb"><img id="thumb-${idx}" alt=""></div>
+        <div class="meta">
+          <div class="fn" title="${item.filename}">${item.filename || 'image'}</div>
+          <div class="predline"><strong>${label}</strong> — ${pct}%</div>
+          <details><summary>Probabilities</summary>
+            <pre>${JSON.stringify(item.probs, null, 2)}</pre>
+          </details>
+        </div>`;
+      grid.appendChild(card);
+    });
+
+    // show local thumbnails
+    [...files].forEach((f, idx) => {
+      const url = URL.createObjectURL(f);
+      const img = document.getElementById(`thumb-${idx}`);
+      img.src = url;
+      img.onload = () => URL.revokeObjectURL(url);
+    });
+  });
+</script>
+</body>
+</html> -->
+
+<!-- 
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Digit Recognizer — Full</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>🧠 Handwritten Digit Recognizer</h1>
+  <div class="controls">
+    <label class="switch">
+      <input id="themeToggle" type="checkbox">
+      <span class="slider"></span>
+    </label>
+    <span id="themeLabel">Light</span>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Draw a Digit</h2>
+    <p class="hint">How: <strong>click & drag</strong> or <strong>touch & drag</strong>. Use Download to save your sketch.</p>
+    <div class="canvas-row">
+      <canvas id="drawCanvas" width="280" height="280" aria-label="Drawing area"></canvas>
+      <div class="canvas-buttons">
+        <label>Confidence threshold:
+          <input id="threshold" type="number" min="0" max="1" step="0.01" value="0.7">
+        </label>
+        <label><input id="smoothing" type="checkbox" checked> Server smoothing</label>
+        <button id="clearBtn" type="button">Clear</button>
+        <button id="downloadBtn" type="button">Download</button>
+        <button id="predictBtn" type="button">Predict</button>
+        <button id="saveGalleryBtn" type="button">Save to Gallery</button>
+      </div>
+    </div>
+    <div id="drawResult" class="result"></div>
+  </section>
+
+  <section class="card">
+    <h2>Upload Multiple Images</h2>
+    <form id="uploadForm">
+      <input id="files" type="file" accept="image/*" multiple />
+      <div class="row small">
+        <label>Confidence threshold:
+          <input id="thresholdUpload" type="number" min="0" max="1" step="0.01" value="0.7">
+        </label>
+        <label><input id="smoothingUpload" type="checkbox" checked> Server smoothing</label>
+      </div>
+      <button type="submit">Predict All</button>
+    </form>
+    <div id="grid" class="grid"></div>
+  </section>
+
+  <section class="card">
+    <h2>Gallery (Saved Drawings)</h2>
+    <p class="hint">Saved drawings persist in your browser. Click a thumbnail to open preview / download.</p>
+    <div id="gallery" class="grid"></div>
+    <div style="margin-top:8px;">
+      <button id="clearGallery">Clear Gallery</button>
+    </div>
+  </section>
+</main>
+
+
+<div id="modal" class="modal hidden">
+  <div class="modal-content">
+    <button id="modalClose" class="modal-close">✕</button>
+    <img id="modalImg" src="" alt="Preview">
+    <div class="modal-meta">
+      <button id="modalDownload">Download</button>
+    </div>
+  </div>
+</div>
+
+<footer>
+  <p>Tip: If model isn't loaded server-side you'll receive a JSON error—run the trainer or put your `trained_model.h5` in project root.</p>
+</footer>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
+
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Digit Recognition</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <h1>Handwritten Digit Recognition</h1>
+        
+        <button id="themeToggle">Toggle Theme</button>
+
+        <div class="upload-section">
+            <input type="file" id="fileInput">
+            <button id="predictFile">Predict from File</button>
+            <div id="filePreview"></div>
+        </div>
+
+        <div class="draw-section">
+            <canvas id="drawCanvas" width="280" height="280"></canvas>
+            <div>
+                <button id="clearCanvas">Clear</button>
+                <button id="predictDraw">Predict Drawing</button>
+            </div>
+        </div>
+
+        <div id="result"></div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/script.js') }}"></script>
+</body>
+</html>
+-->
+
+<!-- templates/index.html -->
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Digit Recognizer — Full</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>🧠 Handwritten Digit Recognizer</h1>
+  <div class="controls">
+    <label class="switch">
+      <input id="themeToggle" type="checkbox">
+      <span class="slider"></span>
+    </label>
+    <span id="themeLabel">Light</span>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Draw a Digit</h2>
+    <p class="hint">How: <strong>click & drag</strong> or <strong>touch & drag</strong>. Use Download to save your sketch.</p>
+    <div class="canvas-row">
+      <canvas id="drawCanvas" width="280" height="280" aria-label="Drawing area"></canvas>
+      <div class="canvas-buttons">
+        <label>Confidence threshold:
+          <input id="threshold" type="number" min="0" max="1" step="0.01" value="0.7">
+        </label>
+        <label><input id="smoothing" type="checkbox" checked> Server smoothing</label>
+        <button id="clearBtn" type="button">Clear</button>
+        <button id="downloadBtn" type="button">Download</button>
+        <button id="predictBtn" type="button">Predict</button>
+        <button id="saveGalleryBtn" type="button">Save to Gallery</button>
+      </div>
+    </div>
+    <div id="drawResult" class="result"></div>
+  </section>
+
+  <section class="card">
+    <h2>Upload Multiple Images</h2>
+    <form id="uploadForm">
+      <input id="files" type="file" accept="image/*" multiple />
+      <div class="row small">
+        <label>Confidence threshold:
+          <input id="thresholdUpload" type="number" min="0" max="1" step="0.01" value="0.7">
+        </label>
+        <label><input id="smoothingUpload" type="checkbox" checked> Server smoothing</label>
+      </div>
+      <button type="submit">Predict All</button>
+    </form>
+    <div id="grid" class="grid"></div>
+  </section>
+
+  <section class="card">
+    <h2>Gallery (Saved Drawings)</h2>
+    <p class="hint">Saved drawings persist in your browser. Click a thumbnail to open preview / download.</p>
+    <div id="gallery" class="grid"></div>
+    <div style="margin-top:8px;">
+      <button id="clearGallery">Clear Gallery</button>
+    </div>
+  </section>
+</main>
+<!--calc section-->
+<section class="card">
+  <h2>Handwriting Calculator</h2>
+  <p class="hint">Draw digits. Use buttons for operators. Build an expression and evaluate it.</p>
+  
+  <!-- Drawing area -->
+  <div class="canvas-row">
+    <canvas id="calcCanvas" width="280" height="280"></canvas>
+    <div class="canvas-buttons">
+      <button id="calcClearBtn" type="button">Clear</button>
+      <button id="calcAddBtn" type="button">Add Digit</button>
+    </div>
+  </div>
+  
+  <!-- Expression builder -->
+  <div class="row">
+    <input id="calcExpr" type="text" readonly placeholder="Expression will appear here">
+  </div>
+
+  <!-- Operator buttons -->
+  <div class="row">
+    <button class="op-btn" data-op="+">+</button>
+    <button class="op-btn" data-op="-">−</button>
+    <button class="op-btn" data-op="*">×</button>
+    <button class="op-btn" data-op="/">÷</button>
+    <button class="op-btn" data-op="**">^</button>
+    <button class="op-btn" data-op="(">(</button>
+    <button class="op-btn" data-op=")">)</button>
+  </div>
+
+  <!-- Evaluate -->
+  <div class="row">
+    <button id="calcEvalBtn" type="button">Evaluate</button>
+  </div>
+  
+  <!-- Result -->
+  <div id="calcResult" class="result"></div>
+</section>
+
+  
+  <div class="row">
+    <input id="calcExpr" type="text" readonly placeholder="Expression will appear here">
+    <button id="calcEvalBtn" type="button">Evaluate</button>
+  </div>
+  
+  <div id="calcResult" class="result"></div>
+</section>
+
+
+<!-- Modal for image preview -->
+<div id="modal" class="modal hidden">
+  <div class="modal-content">
+    <button id="modalClose" class="modal-close">✕</button>
+    <img id="modalImg" src="" alt="Preview">
+    <div class="modal-meta">
+      <button id="modalDownload">Download</button>
+    </div>
+  </div>
+</div>
+
+<footer>
+  <p>Tip: If model isn't loaded server-side you'll receive a JSON error—run the trainer or put your `trained_model.h5` in project root.</p>
+</footer>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
+----------------------------------
+app.py
+
+# app.py
+import os
+import io
+import base64
+import ast
+import operator as op
+import numpy as np
+from PIL import Image, ImageOps, ImageFilter
+from flask import Flask, render_template, request, jsonify, session
+
+import tensorflow as tf
+from tensorflow.keras import models
+
+# -----------------------------
+# Config
+# -----------------------------
+MODEL_PATH = "trained_model.h5"   # change if needed
+DEFAULT_THRESHOLD = 0.70
+APPLY_SMOOTHING = True            # server-side smoothing (Gaussian blur) to help handwriting
+
+app = Flask(__name__)
+app.secret_key = "CHANGE_THIS_TO_A_RANDOM_SECRET"  # <<-- replace with secure random value for production
+
+# -----------------------------
+# Load model (prediction-only)
+# -----------------------------
+model = None
+model_load_error = None
+
+def try_load_model(path):
+    global model, model_load_error
+    if not os.path.exists(path):
+        model_load_error = f"Model file not found at '{path}'. Please place a trained model there."
+        print("[WARN]", model_load_error)
+        model = None
+        return
+
+    try:
+        model = models.load_model(path, compile=False)
+        model_load_error = None
+        print(f"[INFO] Loaded model from {path}")
+    except Exception as e:
+        model = None
+        model_load_error = f"Failed to load model: {e}"
+        print("[ERROR]", model_load_error)
+
+try_load_model(MODEL_PATH)
+
+
+# -----------------------------
+# Preprocessing utilities
+# -----------------------------
+def center_and_resize_to_28(img_L_inverted: Image.Image) -> Image.Image:
+    arr = np.array(img_L_inverted)
+    rows = np.where(arr.max(axis=1) > 0)[0]
+    cols = np.where(arr.max(axis=0) > 0)[0]
+
+    if rows.size and cols.size:
+        r0, r1 = rows[0], rows[-1] + 1
+        c0, c1 = cols[0], cols[-1] + 1
+        arr = arr[r0:r1, c0:c1]
+
+    if arr.size == 0:
+        return Image.new('L', (28, 28), 0)
+
+    h, w = arr.shape
+    if h > w:
+        new_h, new_w = 20, max(1, int(round(20 * w / h)))
+    else:
+        new_w, new_h = 20, max(1, int(round(20 * h / w)))
+
+    digit = Image.fromarray(arr).resize((new_w, new_h), Image.LANCZOS)
+    canvas = Image.new('L', (28, 28), 0)
+    left = (28 - new_w) // 2
+    top = (28 - new_h) // 2
+    canvas.paste(digit, (left, top))
+    return canvas
+
+def preprocess_pil_to_tensor(img: Image.Image, apply_smoothing: bool = True) -> np.ndarray:
+    """
+    Convert PIL image to MNIST-like tensor:
+      - grayscale
+      - optional smoothing (Gaussian blur) to reduce stroke noise
+      - invert (white digit on black)
+      - center+resize to 28x28
+      - normalize and reshape to (1,28,28,1)
+    """
+    img = img.convert("L")
+    if apply_smoothing:
+        # small blur helps thin strokes and reduces jitter
+        img = img.filter(ImageFilter.GaussianBlur(radius=0.9))
+    img = ImageOps.invert(img)
+    img = center_and_resize_to_28(img)
+    arr = np.array(img).astype("float32") / 255.0
+    arr = arr.reshape(1, 28, 28, 1)
+    return arr
+
+def predict_with_confidence_pil(img: Image.Image, threshold: float, smoothing: bool):
+    if model is None:
+        raise RuntimeError(model_load_error or "Model not loaded.")
+    tensor = preprocess_pil_to_tensor(img, apply_smoothing=smoothing)
+    probs = model.predict(tensor, verbose=0)[0]
+    label = int(np.argmax(probs))
+    conf = float(np.max(probs))
+    is_sure = conf >= threshold
+    return label, conf, is_sure, probs.tolist()
+
+
+# -----------------------------
+# Safe eval (AST-based)
+# -----------------------------
+# Allowed operators and mapping
+ALLOWED_OPERATORS = {
+    ast.Add: op.add,
+    ast.Sub: op.sub,
+    ast.Mult: op.mul,
+    ast.Div: op.truediv,
+    ast.Pow: op.pow,
+    ast.Mod: op.mod,
+    ast.USub: op.neg,
+    ast.UAdd: op.pos,
+}
+
+def safe_eval(node):
+    """
+    Evaluate an AST node safely supporting numbers, binary ops and parentheses.
+    """
+    if isinstance(node, ast.Expression):
+        return safe_eval(node.body)
+    if isinstance(node, ast.Num):  # Python <3.8
+        return node.n
+    if hasattr(ast, "Constant") and isinstance(node, ast.Constant):  # Python 3.8+
+        if isinstance(node.value, (int, float)):
+            return node.value
+        raise ValueError("Unsupported constant type")
+    if isinstance(node, ast.BinOp):
+        left = safe_eval(node.left)
+        right = safe_eval(node.right)
+        op_type = type(node.op)
+        if op_type in ALLOWED_OPERATORS:
+            return ALLOWED_OPERATORS[op_type](left, right)
+        raise ValueError(f"Unsupported operator {op_type}")
+    if isinstance(node, ast.UnaryOp):
+        operand = safe_eval(node.operand)
+        op_type = type(node.op)
+        if op_type in ALLOWED_OPERATORS:
+            return ALLOWED_OPERATORS[op_type](operand)
+        raise ValueError(f"Unsupported unary operator {op_type}")
+    raise ValueError(f"Unsupported expression: {type(node)}")
+
+def evaluate_expression_safely(expr: str):
+    """
+    Evaluate expression string after minor normalization:
+      - Replace unicode multiplication/division signs if present
+      - Ensure only allowed characters appear (digits, operators, parentheses, dot, spaces)
+    """
+    if expr is None:
+        raise ValueError("Empty expression")
+    # normalize display operators to python ones
+    expr = expr.replace("×", "*").replace("÷", "/").replace("^", "**")
+    allowed_chars = "0123456789.+-*/()% "
+    # quick check: after replacing '**' keep allowed
+    tmp = expr.replace("**", "")  # temporarily remove power token for check
+    if not all(ch in allowed_chars for ch in tmp):
+        raise ValueError("Invalid characters in expression")
+    # parse and evaluate using ast
+    parsed = ast.parse(expr, mode='eval')
+    return safe_eval(parsed)
+
+
+# -----------------------------
+# Routes
+# -----------------------------
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/model_status", methods=["GET"])
+def model_status():
+    if model is None:
+        return jsonify({"loaded": False, "error": model_load_error})
+    return jsonify({"loaded": True, "model_path": MODEL_PATH})
+
+
+@app.route("/predict_draw", methods=["POST"])
+def predict_draw():
+    """
+    Body JSON: { image: "data:image/png;base64,...", threshold: 0.7?, smoothing: true|false? }
+    """
+    try:
+        if model is None:
+            return jsonify({"error": model_load_error or "Model is not loaded."}), 400
+
+        data = request.get_json(force=True)
+        data_url = data.get("image")
+        threshold = float(data.get("threshold", DEFAULT_THRESHOLD))
+        smoothing = bool(data.get("smoothing", APPLY_SMOOTHING))
+
+        header, b64data = data_url.split(",", 1)
+        img_bytes = base64.b64decode(b64data)
+        img = Image.open(io.BytesIO(img_bytes))
+
+        label, conf, is_sure, probs = predict_with_confidence_pil(img, threshold, smoothing)
+        return jsonify({
+            "digit": None if not is_sure else label,
+            "raw_digit": label,
+            "confidence": conf,
+            "is_sure": is_sure,
+            "probs": probs
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/predict_files", methods=["POST"])
+def predict_files():
+    try:
+        if model is None:
+            return jsonify({"error": model_load_error or "Model not loaded."}), 400
+
+        threshold = float(request.form.get("threshold", DEFAULT_THRESHOLD))
+        smoothing = request.form.get("smoothing", str(APPLY_SMOOTHING)).lower() in ("1","true","yes")
+        files = request.files.getlist("files")
+        results = []
+        for f in files:
+            img = Image.open(f.stream)
+            label, conf, is_sure, probs = predict_with_confidence_pil(img, threshold, smoothing)
+            results.append({
+                "filename": f.filename,
+                "digit": None if not is_sure else label,
+                "raw_digit": label,
+                "confidence": conf,
+                "is_sure": is_sure,
+                "probs": probs
+            })
+        return jsonify({"results": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+# New: predict + append (atomic)
+@app.route("/predict_and_append", methods=["POST"])
+def predict_and_append():
+    """
+    Accepts same body as predict_draw; if digit predicted confidently, append to session expression.
+    Returns the prediction and updated expression.
+    """
+    try:
+        if model is None:
+            return jsonify({"error": model_load_error or "Model not loaded."}), 400
+
+        data = request.get_json(force=True)
+        data_url = data.get("image")
+        threshold = float(data.get("threshold", DEFAULT_THRESHOLD))
+        smoothing = bool(data.get("smoothing", APPLY_SMOOTHING))
+
+        header, b64data = data_url.split(",", 1)
+        img_bytes = base64.b64decode(b64data)
+        img = Image.open(io.BytesIO(img_bytes))
+
+        label, conf, is_sure, probs = predict_with_confidence_pil(img, threshold, smoothing)
+
+        # ensure session key exists
+        expr = session.get("expression", "")
+        appended = False
+        if is_sure:
+            expr = expr + str(label)
+            session["expression"] = expr
+            appended = True
+
+        return jsonify({
+            "digit": None if not is_sure else label,
+            "raw_digit": label,
+            "confidence": conf,
+            "is_sure": is_sure,
+            "probs": probs,
+            "appended": appended,
+            "expression": expr
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+# Append symbol (operators or digits) via API (centralized)
+@app.route("/append_symbol", methods=["POST"])
+def append_symbol():
+    try:
+        data = request.get_json(force=True)
+        symbol = data.get("symbol", "")
+        if not isinstance(symbol, str) or not symbol:
+            return jsonify({"error": "Missing symbol"}), 400
+
+        # normalize common display operators
+        symbol = symbol.replace("×", "*").replace("÷", "/").replace("^", "**")
+
+        # one more validation: only allow small set of tokens
+        allowed = set("0123456789+-*/()%. ")
+        test = symbol.replace("**", "")  # remove power token before checking allowed chars
+        if not all(ch in allowed for ch in test):
+            return jsonify({"error": "Invalid symbol"}), 400
+
+        expr = session.get("expression", "")
+        expr = expr + symbol
+        session["expression"] = expr
+        return jsonify({"expression": expr})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/clear_expression", methods=["POST"])
+def clear_expression():
+    try:
+        session["expression"] = ""
+        return jsonify({"expression": ""})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/get_expression", methods=["GET"])
+def get_expression():
+    try:
+        expr = session.get("expression", "")
+        return jsonify({"expression": expr})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/evaluate_expression", methods=["POST"])
+def evaluate_expression():
+    try:
+        # Check if an expression was supplied in the body, otherwise use session one
+        data = request.get_json(force=True) if request.data else {}
+        expr = data.get("expression", None)
+        if expr is None:
+            expr = session.get("expression", "")
+
+        # evaluate safely
+        result = evaluate_expression_safely(expr)
+        # optionally clear expression or keep it — we keep it (client can clear explicitly)
+        return jsonify({"expression": expr, "result": result})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+def segment_digits(image):
+    """
+    Takes a binary canvas image and segments into individual digits.
+    Returns list of digit images (28x28).
+    """
+    # Convert to grayscale
+    gray = cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
+    
+    # Threshold
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # Find contours (each digit)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    digit_imgs = []
+    boxes = []
+    
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w*h > 100:  # ignore tiny noise
+            boxes.append((x, y, w, h))
+    
+    # Sort left-to-right
+    boxes = sorted(boxes, key=lambda b: b[0])
+    
+    for (x, y, w, h) in boxes:
+        digit = thresh[y:y+h, x:x+w]
+        # Pad to square
+        pad = abs(h - w) // 2
+        if h > w:
+            digit = cv2.copyMakeBorder(digit, 0, 0, pad, pad, cv2.BORDER_CONSTANT, value=0)
+        else:
+            digit = cv2.copyMakeBorder(digit, pad, pad, 0, 0, cv2.BORDER_CONSTANT, value=0)
+        
+        # Resize to MNIST format
+        digit = cv2.resize(digit, (28, 28), interpolation=cv2.INTER_AREA)
+        digit = digit.astype("float32") / 255.0
+        digit = np.expand_dims(digit, axis=(0, -1))  # (1, 28, 28, 1)
+        
+        digit_imgs.append(digit)
+    
+    return digit_imgs
+
+@app.route("/predict", methods=["POST"])
+def predict():
+    file = request.files['file'].read()
+    npimg = np.frombuffer(file, np.uint8)
+    img = cv2.imdecode(npimg, cv2.IMREAD_UNCHANGED)
+    
+    # Segment digits
+    digits = segment_digits(img)
+    preds = []
+    
+    for d in digits:
+        prediction = model.predict(d)
+        preds.append(str(np.argmax(prediction)))
+    
+    result = "".join(preds)  # e.g., "123"
+    
+    return jsonify({"prediction": result})
+
+if __name__ == "__main__":
+    print("[INFO] Starting Flask app (prediction-only).")
+    app.run(debug=True)
+
+
+
+**************8
+index
+
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Digit Recognizer — Full</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>🧠 Handwritten Digit Recognizer</h1>
+  <div class="controls">
+    <label class="switch">
+      <input id="themeToggle" type="checkbox">
+      <span class="slider"></span>
+    </label>
+    <span id="themeLabel">Light</span>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Draw a Digit</h2>
+    <p class="hint">How: <strong>click & drag</strong> or <strong>touch & drag</strong>. Use Download to save your sketch.</p>
+    <div class="canvas-row">
+      <canvas id="drawCanvas" width="280" height="280" aria-label="Drawing area"></canvas>
+      <div class="canvas-buttons">
+        <label>Confidence threshold:
+          <input id="threshold" type="number" min="0" max="1" step="0.01" value="0.7">
+        </label>
+        <label><input id="smoothing" type="checkbox" checked> Server smoothing</label>
+        <button id="clearBtn" type="button">Clear</button>
+        <button id="downloadBtn" type="button">Download</button>
+        <button id="predictBtn" type="button">Predict</button>
+        <button id="saveGalleryBtn" type="button">Save to Gallery</button>
+      </div>
+    </div>
+    <div id="drawResult" class="result"></div>
+  </section>
+
+  <section class="card">
+    <h2>Upload Multiple Images</h2>
+    <form id="uploadForm">
+      <input id="files" type="file" accept="image/*" multiple />
+      <div class="row small">
+        <label>Confidence threshold:
+          <input id="thresholdUpload" type="number" min="0" max="1" step="0.01" value="0.7">
+        </label>
+        <label><input id="smoothingUpload" type="checkbox" checked> Server smoothing</label>
+      </div>
+      <button type="submit">Predict All</button>
+    </form>
+    <div id="grid" class="grid"></div>
+  </section>
+
+  <section class="card">
+    <h2>Gallery (Saved Drawings)</h2>
+    <p class="hint">Saved drawings persist in your browser. Click a thumbnail to open preview / download.</p>
+    <div id="gallery" class="grid"></div>
+    <div style="margin-top:8px;">
+      <button id="clearGallery">Clear Gallery</button>
+    </div>
+  </section>
+
+  <!-- Handwriting Calculator -->
+  <section class="card">
+    <h2>Handwriting Calculator</h2>
+    <p class="hint">Draw digits. Use buttons for operators. Build an expression and evaluate it. Digits are appended from handwriting prediction; operators are appended via buttons.</p>
+    
+    <div class="canvas-row">
+      <canvas id="calcCanvas" width="280" height="280"></canvas>
+      <div class="canvas-buttons">
+        <button id="calcClearBtn" type="button">Clear</button>
+        <button id="calcAddBtn" type="button">Add Digit</button>
+        <button id="calcClearExpr" type="button">Clear Expression</button>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:10px;">
+      <input id="calcExpr" type="text" readonly placeholder="Expression will appear here" style="flex:1; padding:8px; border-radius:8px; border:1px solid #ddd;">
+      <button id="calcEvalBtn" type="button">Evaluate</button>
+    </div>
+
+    <div class="row" style="margin-top:10px; flex-wrap:wrap;">
+      <button class="op-btn" data-op="+">+</button>
+      <button class="op-btn" data-op="-">−</button>
+      <button class="op-btn" data-op="*">×</button>
+      <button class="op-btn" data-op="/">÷</button>
+      <button class="op-btn" data-op="**">^</button>
+      <button class="op-btn" data-op="(">(</button>
+      <button class="op-btn" data-op=")">)</button>
+      <button class="op-btn" data-op=".">.</button>
+      <button id="calcBackspace" type="button">Backspace</button>
+    </div>
+
+    <div id="calcResult" class="result" style="margin-top:10px;"></div>
+  </section>
+</main>
+
+<!-- Modal for image preview -->
+<div id="modal" class="modal hidden">
+  <div class="modal-content">
+    <button id="modalClose" class="modal-close">✕</button>
+    <img id="modalImg" src="" alt="Preview">
+    <div class="modal-meta">
+      <button id="modalDownload">Download</button>
+    </div>
+  </div>
+</div>
+
+<footer>
+  <p>Tip: If model isn't loaded server-side you'll receive a JSON error—run the trainer or put your `trained_model.h5` in project root.</p>
+</footer>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
+**88*****************88
+app.js
+
+// static/app.js
+// Handles drawing, canvas predict, gallery, uploads, modal preview, and calculator
+
+// Theme
+const themeToggle = document.getElementById('themeToggle');
+const themeLabel = document.getElementById('themeLabel');
+function setTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  themeLabel.textContent = t[0].toUpperCase() + t.slice(1);
+  localStorage.setItem('theme', t);
+  themeToggle.checked = (t === 'dark');
+}
+setTheme(localStorage.getItem('theme') || 'light');
+themeToggle.addEventListener('change', () => setTheme(themeToggle.checked ? 'dark' : 'light'));
+
+// Canvas (main)
+const canvas = document.getElementById('drawCanvas');
+const ctx = canvas.getContext('2d');
+canvas.width = 280; canvas.height = 280;
+function resetCanvas() {
+  ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.strokeStyle = '#000000'; ctx.lineWidth = 20; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+}
+resetCanvas();
+
+let drawing=false, lastX=0, lastY=0;
+function getPos(e){
+  const rect = canvas.getBoundingClientRect();
+  const isTouch = e.touches && e.touches.length;
+  const clientX = isTouch ? e.touches[0].clientX : e.clientX;
+  const clientY = isTouch ? e.touches[0].clientY : e.clientY;
+  return { x: clientX - rect.left, y: clientY - rect.top };
+}
+function startDraw(e){ e.preventDefault(); drawing=true; const p=getPos(e); lastX=p.x; lastY=p.y; }
+function moveDraw(e){ if(!drawing) return; e.preventDefault(); const p=getPos(e); ctx.beginPath(); ctx.moveTo(lastX,lastY); ctx.lineTo(p.x,p.y); ctx.stroke(); lastX=p.x; lastY=p.y; }
+function endDraw(e){ if(!drawing) return; e.preventDefault(); drawing=false; ctx.beginPath(); }
+
+canvas.addEventListener('mousedown', startDraw);
+canvas.addEventListener('mousemove', moveDraw);
+canvas.addEventListener('mouseup', endDraw);
+canvas.addEventListener('mouseleave', endDraw);
+canvas.addEventListener('touchstart', startDraw, {passive:false});
+canvas.addEventListener('touchmove', moveDraw, {passive:false});
+canvas.addEventListener('touchend', endDraw);
+
+// Buttons (main)
+document.getElementById('clearBtn').addEventListener('click', () => { resetCanvas(); document.getElementById('drawResult').innerHTML=''; });
+document.getElementById('downloadBtn').addEventListener('click', () => {
+  const a = document.createElement('a'); a.href = canvas.toDataURL('image/png'); a.download='digit.png'; a.click();
+});
+
+// Predict canvas (non-calculator)
+document.getElementById('predictBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('predictBtn');
+  btn.disabled=true; btn.textContent='Predicting...';
+  try {
+    const threshold = parseFloat(document.getElementById('threshold').value || '0.7');
+    const smoothing = document.getElementById('smoothing') ? document.getElementById('smoothing').checked : true;
+    const dataURL = canvas.toDataURL('image/png');
+    const res = await fetch('/predict_draw', {
+      method:'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ image: dataURL, threshold, smoothing })
+    });
+    const data = await res.json();
+    const out = document.getElementById('drawResult');
+    if (data.error) {
+      out.innerHTML = `<div class="error">Error: ${data.error}</div>`;
+    } else {
+      const pct = (data.confidence*100).toFixed(1);
+      const shown = data.is_sure ? data.raw_digit : 'Not Sure';
+      out.innerHTML = `<div class="pred"><div class="big">${shown}</div><div>Confidence: ${pct}%</div><details><summary>Class probs</summary><pre>${JSON.stringify(data.probs,null,2)}</pre></details></div>`;
+    }
+  } catch (e) {
+    document.getElementById('drawResult').innerHTML = `<div class="error">Error: ${e}</div>`;
+  } finally {
+    btn.disabled=false; btn.textContent='Predict';
+  }
+});
+
+// Save to gallery (localStorage)
+const GALLERY_KEY = 'digit_gallery_v1';
+function loadGallery(){ try { return JSON.parse(localStorage.getItem(GALLERY_KEY) || '[]'); } catch(e){ return []; } }
+function saveGallery(arr){ localStorage.setItem(GALLERY_KEY, JSON.stringify(arr)); }
+function renderGallery(){
+  const gallery = document.getElementById('gallery');
+  gallery.innerHTML = '';
+  const items = loadGallery();
+  items.forEach((dataURL, idx) => {
+    const div = document.createElement('div'); div.className='grid-item';
+    div.innerHTML = `<div class="thumb"><img id="gimg-${idx}"></div><div class="meta"><div class="fn">Saved ${idx+1}</div><div class="predline"><button data-idx="${idx}" class="openBtn">Open</button></div></div>`;
+    gallery.appendChild(div);
+    const img = document.getElementById(`gimg-${idx}`);
+    img.src = dataURL;
+  });
+}
+document.getElementById('saveGalleryBtn').addEventListener('click', () => {
+  const dataURL = canvas.toDataURL('image/png');
+  const items = loadGallery();
+  items.unshift(dataURL); // newest first
+  if (items.length > 50) items.pop();
+  saveGallery(items);
+  renderGallery();
+});
+document.getElementById('clearGallery').addEventListener('click', () => { localStorage.removeItem(GALLERY_KEY); renderGallery(); });
+
+// Modal preview
+const modal = document.getElementById('modal');
+const modalImg = document.getElementById('modalImg');
+const modalClose = document.getElementById('modalClose');
+const modalDownload = document.getElementById('modalDownload');
+
+function openModalWithSrc(src){
+  modalImg.src = src;
+  modal.classList.remove('hidden');
+  modalDownload.onclick = () => { const a=document.createElement('a'); a.href=src; a.download='image.png'; a.click(); };
+}
+modalClose.addEventListener('click', ()=> modal.classList.add('hidden'));
+modal.addEventListener('click', (e) => { if (e.target === modal) modal.classList.add('hidden'); });
+
+// open buttons delegate
+document.body.addEventListener('click', (e) => {
+  if (e.target.classList.contains('openBtn')) {
+    const idx = parseInt(e.target.dataset.idx, 10);
+    const items = loadGallery();
+    openModalWithSrc(items[idx]);
+  }
+});
+
+// Upload & predict files (grid + popup on click)
+document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const grid = document.getElementById('grid'); grid.innerHTML='';
+  const files = document.getElementById('files').files;
+  if (!files.length) return;
+  const threshold = parseFloat(document.getElementById('thresholdUpload').value || '0.7');
+  const smoothing = document.getElementById('smoothingUpload') ? document.getElementById('smoothingUpload').checked : true;
+  const fd = new FormData();
+  for (const f of files) fd.append('files', f);
+  fd.append('threshold', threshold);
+  fd.append('smoothing', smoothing ? 'true' : 'false');
+
+  const res = await fetch('/predict_files', { method:'POST', body: fd });
+  const data = await res.json();
+  if (data.error) { grid.innerHTML = `<div class="error">Error: ${data.error}</div>`; return; }
+  data.results.forEach((item, idx) => {
+    const pct = (item.confidence*100).toFixed(1);
+    const label = item.is_sure ? item.raw_digit : 'Not Sure';
+    const card = document.createElement('div'); card.className='grid-item';
+    card.innerHTML = `<div class="thumb"><img id="upimg-${idx}" alt=""></div><div class="meta"><div class="fn" title="${item.filename}">${item.filename}</div><div class="predline"><strong>${label}</strong> — ${pct}%</div><details><summary>Probs</summary><pre>${JSON.stringify(item.probs,null,2)}</pre></details></div>`;
+    grid.appendChild(card);
+  });
+  // show thumbnails
+  [...files].forEach((f, idx) => {
+    const url = URL.createObjectURL(f);
+    const img = document.getElementById(`upimg-${idx}`);
+    img.src = url;
+    img.addEventListener('click', () => openModalWithSrc(url));
+    img.onload = () => URL.revokeObjectURL(url);
+  });
+});
+
+// initial render
+renderGallery();
+
+// ----------------- Calculator (client-side, server-centralized expr) -----------------
+const calcCanvas = document.getElementById('calcCanvas');
+const calcCtx = calcCanvas.getContext('2d');
+calcCanvas.width = 280; calcCanvas.height = 280;
+function resetCalcCanvas() {
+  calcCtx.fillStyle = '#ffffff';
+  calcCtx.fillRect(0,0,calcCanvas.width,calcCanvas.height);
+  calcCtx.strokeStyle = '#000000';
+  calcCtx.lineWidth = 20;
+  calcCtx.lineCap = 'round';
+  calcCtx.lineJoin = 'round';
+}
+resetCalcCanvas();
+
+let calcDrawing = false, calcLastX=0, calcLastY=0;
+function calcGetPos(e){ const r = calcCanvas.getBoundingClientRect(); const x=(e.touches?e.touches[0].clientX:e.clientX)-r.left; const y=(e.touches?e.touches[0].clientY:e.clientY)-r.top; return {x,y}; }
+function calcStart(e){ e.preventDefault(); calcDrawing=true; const p=calcGetPos(e); calcLastX=p.x; calcLastY=p.y; }
+function calcMove(e){ if(!calcDrawing) return; e.preventDefault(); const p=calcGetPos(e); calcCtx.beginPath(); calcCtx.moveTo(calcLastX,calcLastY); calcCtx.lineTo(p.x,p.y); calcCtx.stroke(); calcLastX=p.x; calcLastY=p.y; }
+function calcEnd(e){ if(!calcDrawing) return; e.preventDefault(); calcDrawing=false; calcCtx.beginPath(); }
+
+calcCanvas.addEventListener('mousedown', calcStart);
+calcCanvas.addEventListener('mousemove', calcMove);
+calcCanvas.addEventListener('mouseup', calcEnd);
+calcCanvas.addEventListener('mouseleave', calcEnd);
+calcCanvas.addEventListener('touchstart', calcStart, {passive:false});
+calcCanvas.addEventListener('touchmove', calcMove, {passive:false});
+calcCanvas.addEventListener('touchend', calcEnd);
+
+document.getElementById('calcClearBtn').addEventListener('click', () => { resetCalcCanvas(); });
+
+// helper: refresh expression display from server
+async function refreshExpressionDisplay(){
+  const res = await fetch('/get_expression');
+  const data = await res.json();
+  if (data.expression !== undefined) {
+    document.getElementById('calcExpr').value = data.expression;
+  }
+}
+refreshExpressionDisplay();
+
+// Add digit (predict on server and append atomically)
+document.getElementById('calcAddBtn').addEventListener('click', async () => {
+  const dataURL = calcCanvas.toDataURL('image/png');
+  const threshold = parseFloat(document.getElementById('threshold').value || '0.7');
+  const smoothing = document.getElementById('smoothing') ? document.getElementById('smoothing').checked : true;
+  
+  const res = await fetch('/predict_and_append', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ image: dataURL, threshold, smoothing })
+  });
+  const data = await res.json();
+  
+  if (data.error) {
+    alert("Prediction error: " + data.error);
+    return;
+  }
+
+  if (data.is_sure) {
+    // server returned updated expression
+    document.getElementById('calcExpr').value = data.expression || "";
+  } else {
+    alert("Uncertain digit prediction. Please redraw.");
+  }
+  resetCalcCanvas();
+});
+
+// Operator buttons -> append symbol on server
+document.querySelectorAll('.op-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const op = btn.dataset.op;
+    const res = await fetch('/append_symbol', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ symbol: op })
+    });
+    const data = await res.json();
+    if (data.error) {
+      alert("Could not append operator: " + data.error);
+      return;
+    }
+    document.getElementById('calcExpr').value = data.expression || "";
+  });
+});
+
+// Backspace (client-side convenience: request server to remove last char)
+document.getElementById('calcBackspace').addEventListener('click', async () => {
+  // fetch current expression, remove last char, and set it by clearing then appending
+  const g = await fetch('/get_expression'); const dg = await g.json();
+  if (dg.error) { alert(dg.error); return; }
+  let expr = dg.expression || "";
+  if (!expr) return;
+  expr = expr.slice(0, -1);
+  // set new expr by clearing and then appending in one POST (here we just call clear then append whole string)
+  await fetch('/clear_expression', { method:'POST' });
+  if (expr.length) {
+    // append entire expr in one shot (safe because server validates)
+    await fetch('/append_symbol', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ symbol: expr })
+    });
+  }
+  await refreshExpressionDisplay();
+});
+
+// Clear expression (server-side)
+document.getElementById('calcClearExpr').addEventListener('click', async () => {
+  const res = await fetch('/clear_expression', { method:'POST' });
+  const data = await res.json();
+  if (data.error) { alert("Error clearing expression: " + data.error); return; }
+  document.getElementById('calcExpr').value = data.expression;
+});
+
+// Evaluate expression (server-side)
+document.getElementById('calcEvalBtn').addEventListener('click', async () => {
+  const res = await fetch('/evaluate_expression', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({}) // server will use session expression by default
+  });
+  const data = await res.json();
+  const out = document.getElementById('calcResult');
+  if (data.error) {
+    out.innerHTML = `<div class="error">${data.error}</div>`;
+  } else {
+    out.innerHTML = `<div class="pred"><div class="big">${data.result}</div><div>from ${data.expression}</div></div>`;
+    // keep expression (do not auto-clear) — user can clear manually
+  }
+  // refresh expression display in case server changed formatting
+  await refreshExpressionDisplay();
+});
+
+
+*******************************
+css
+
+/* static/style.css (full CSS) */
+:root {
+  --bg: #ffffff;
+  --fg: #111827;
+  --muted: #6b7280;
+  --card: #f9fafb;
+  --accent: #2563eb;
+  --accent-contrast: #ffffff;
+  --border: #e5e7eb;
+}
+:root[data-theme="dark"] {
+  --bg: #0b0f19;
+  --fg: #e5e7eb;
+  --muted: #9ca3af;
+  --card: #111827;
+  --accent: #60a5fa;
+  --accent-contrast: #0b0f19;
+  --border: #1f2937;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+header, footer {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 16px 20px;
+}
+header { display:flex; align-items:center; justify-content:space-between; }
+h1 { margin:0; font-size:1.4rem; }
+h2 { margin:0 0 12px; }
+.hint { margin: 6px 0 12px; color: var(--muted); }
+
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 8px 20px 40px;
+  display: grid;
+  gap: 16px;
+  grid-template-columns: 1fr 1fr;
+}
+@media (max-width: 960px){ main{ grid-template-columns:1fr; } }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 16px;
+  box-shadow: 0 2px 10px rgb(0 0 0 / 6%);
+}
+
+.canvas-row { display:flex; gap:16px; align-items:flex-start; }
+canvas {
+  border: 2px dashed var(--border);
+  border-radius: 12px;
+  background: #ffffff;
+  width: 280px; height: 280px;
+  touch-action: none;
+}
+
+
+
+.canvas-buttons { display:flex; flex-direction:column; gap:8px; }
+.row { display:flex; gap:12px; align-items:center; }
+small { font-size: 0.85rem; color: var(--muted); }
+
+button {
+  appearance: none; border: none;
+  background: var(--accent); color: var(--accent-contrast);
+  padding: 8px 12px; border-radius: 10px; font-weight: 600; cursor: pointer;
+}
+button[disabled]{ opacity: .6; cursor: default; }
+
+input[type="number"]{
+  width: 120px; padding: 6px 8px; border-radius: 8px; border:1px solid var(--border);
+  background: var(--bg); color: var(--fg);
+}
+input[type="file"]{ display:block; margin:8px 0 10px; }
+
+.result .big{ font-size: 40px; font-weight: 800; margin-bottom: 6px; }
+.pred{
+  background: rgba(0,0,0,0.04); padding:10px; border-radius:12px; border:1px solid var(--border);
+}
+:root[data-theme="dark"] .pred { background: rgba(255,255,255,0.05); }
+
+.grid {
+  display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+}
+.grid-item{
+  display:grid; grid-template-columns: 90px 1fr; gap:10px;
+  background: var(--bg); border:1px solid var(--border);
+  border-radius:12px; padding:10px;
+}
+.thumb{ width:90px; height:90px; border-radius:8px; overflow:hidden; display:flex; align-items:center; justify-content:center; background:#fff; border:1px dashed var(--border); }
+.thumb img{ max-width:100%; max-height:100%; }
+.meta .fn{ font-weight:600; margin-bottom:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.predline{ color: var(--muted); }
+
+.error{
+  color:#ef4444; font-weight:600; padding:8px 10px;
+  background: rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.2); border-radius:10px;
+}
+
+/* Modal */
+.modal { position: fixed; inset: 0; display:flex; align-items:center; justify-content:center; background: rgba(0,0,0,0.5); z-index: 2000; }
+.modal.hidden { display: none; }
+.modal-content {
+  background: var(--card); padding: 12px; border-radius: 12px; max-width: 90vw; max-height: 90vh; overflow: auto;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+  position: relative;
+}
+.modal img { max-width: 80vw; max-height: 70vh; display:block; margin: 0 auto; }
+.modal-close { position:absolute; right:8px; top:8px; background:transparent; border:none; font-size:18px; cursor:pointer; }
+
+/* Theme switcher */
+.switch { position: relative; display: inline-block; width: 52px; height: 28px; }
+.switch input { display:none; }
+.slider { position: absolute; cursor: pointer; inset:0; background:#ccc; transition:.2s; border-radius:28px; }
+.slider:before { content:""; position:absolute; height:22px; width:22px; left:3px; bottom:3px; background:#fff; transition:.2s; border-radius:50%; }
+input:checked + .slider { background: var(--accent); }
+input:checked + .slider:before { transform: translateX(24px); }
+
+---------------------------------------
+# app.py import os import io import base64 import ast import operator as op import numpy as np from PIL import Image, ImageOps, ImageFilter from flask import Flask, render_template, request, jsonify, session import tensorflow as tf from tensorflow.keras import models # ----------------------------- # Config # ----------------------------- MODEL_PATH = "trained_model.h5" # change if needed DEFAULT_THRESHOLD = 0.70 APPLY_SMOOTHING = True # server-side smoothing (Gaussian blur) to help handwriting app = Flask(__name__) app.secret_key = "CHANGE_THIS_TO_A_RANDOM_SECRET" # <<-- replace with secure random value for production # ----------------------------- # Load model (prediction-only) # ----------------------------- model = None model_load_error = None def try_load_model(path): global model, model_load_error if not os.path.exists(path): model_load_error = f"Model file not found at '{path}'. Please place a trained model there." print("[WARN]", model_load_error) model = None return try: model = models.load_model(path, compile=False) model_load_error = None print(f"[INFO] Loaded model from {path}") except Exception as e: model = None model_load_error = f"Failed to load model: {e}" print("[ERROR]", model_load_error) try_load_model(MODEL_PATH) # ----------------------------- # Preprocessing utilities # ----------------------------- def center_and_resize_to_28(img_L_inverted: Image.Image) -> Image.Image: arr = np.array(img_L_inverted) rows = np.where(arr.max(axis=1) > 0)[0] cols = np.where(arr.max(axis=0) > 0)[0] if rows.size and cols.size: r0, r1 = rows[0], rows[-1] + 1 c0, c1 = cols[0], cols[-1] + 1 arr = arr[r0:r1, c0:c1] if arr.size == 0: return Image.new('L', (28, 28), 0) h, w = arr.shape if h > w: new_h, new_w = 20, max(1, int(round(20 * w / h))) else: new_w, new_h = 20, max(1, int(round(20 * h / w))) digit = Image.fromarray(arr).resize((new_w, new_h), Image.LANCZOS) canvas = Image.new('L', (28, 28), 0) left = (28 - new_w) // 2 top = (28 - new_h) // 2 canvas.paste(digit, (left, top)) return canvas def preprocess_pil_to_tensor(img: Image.Image, apply_smoothing: bool = True) -> np.ndarray: """ Convert PIL image to MNIST-like tensor: - grayscale - optional smoothing (Gaussian blur) to reduce stroke noise - invert (white digit on black) - center+resize to 28x28 - normalize and reshape to (1,28,28,1) """ img = img.convert("L") if apply_smoothing: # small blur helps thin strokes and reduces jitter img = img.filter(ImageFilter.GaussianBlur(radius=0.9)) img = ImageOps.invert(img) img = center_and_resize_to_28(img) arr = np.array(img).astype("float32") / 255.0 arr = arr.reshape(1, 28, 28, 1) return arr def predict_with_confidence_pil(img: Image.Image, threshold: float, smoothing: bool): if model is None: raise RuntimeError(model_load_error or "Model not loaded.") tensor = preprocess_pil_to_tensor(img, apply_smoothing=smoothing) probs = model.predict(tensor, verbose=0)[0] label = int(np.argmax(probs)) conf = float(np.max(probs)) is_sure = conf >= threshold return label, conf, is_sure, probs.tolist() # ----------------------------- # Safe eval (AST-based) # ----------------------------- # Allowed operators and mapping ALLOWED_OPERATORS = { ast.Add: op.add, ast.Sub: op.sub, ast.Mult: op.mul, ast.Div: op.truediv, ast.Pow: op.pow, ast.Mod: op.mod, ast.USub: op.neg, ast.UAdd: op.pos, } def safe_eval(node): """ Evaluate an AST node safely supporting numbers, binary ops and parentheses. """ if isinstance(node, ast.Expression): return safe_eval(node.body) if isinstance(node, ast.Num): # Python <3.8 return node.n if hasattr(ast, "Constant") and isinstance(node, ast.Constant): # Python 3.8+ if isinstance(node.value, (int, float)): return node.value raise ValueError("Unsupported constant type") if isinstance(node, ast.BinOp): left = safe_eval(node.left) right = safe_eval(node.right) op_type = type(node.op) if op_type in ALLOWED_OPERATORS: return ALLOWED_OPERATORS[op_type](left, right) raise ValueError(f"Unsupported operator {op_type}") if isinstance(node, ast.UnaryOp): operand = safe_eval(node.operand) op_type = type(node.op) if op_type in ALLOWED_OPERATORS: return ALLOWED_OPERATORS[op_type](operand) raise ValueError(f"Unsupported unary operator {op_type}") raise ValueError(f"Unsupported expression: {type(node)}") def evaluate_expression_safely(expr: str): """ Evaluate expression string after minor normalization: - Replace unicode multiplication/division signs if present - Ensure only allowed characters appear (digits, operators, parentheses, dot, spaces) """ if expr is None: raise ValueError("Empty expression") # normalize display operators to python ones expr = expr.replace("×", "*").replace("÷", "/").replace("^", "**") allowed_chars = "0123456789.+-*/()% " # quick check: after replacing '**' keep allowed tmp = expr.replace("**", "") # temporarily remove power token for check if not all(ch in allowed_chars for ch in tmp): raise ValueError("Invalid characters in expression") # parse and evaluate using ast parsed = ast.parse(expr, mode='eval') return safe_eval(parsed) # ----------------------------- # Routes # ----------------------------- @app.route("/") def index(): return render_template("index.html") @app.route("/model_status", methods=["GET"]) def model_status(): if model is None: return jsonify({"loaded": False, "error": model_load_error}) return jsonify({"loaded": True, "model_path": MODEL_PATH}) @app.route("/predict_draw", methods=["POST"]) def predict_draw(): """ Body JSON: { image: "data:image/png;base64,...", threshold: 0.7?, smoothing: true|false? } """ try: if model is None: return jsonify({"error": model_load_error or "Model is not loaded."}), 400 data = request.get_json(force=True) data_url = data.get("image") threshold = float(data.get("threshold", DEFAULT_THRESHOLD)) smoothing = bool(data.get("smoothing", APPLY_SMOOTHING)) header, b64data = data_url.split(",", 1) img_bytes = base64.b64decode(b64data) img = Image.open(io.BytesIO(img_bytes)) label, conf, is_sure, probs = predict_with_confidence_pil(img, threshold, smoothing) return jsonify({ "digit": None if not is_sure else label, "raw_digit": label, "confidence": conf, "is_sure": is_sure, "probs": probs }) except Exception as e: return jsonify({"error": str(e)}), 400 @app.route("/predict_files", methods=["POST"]) def predict_files(): try: if model is None: return jsonify({"error": model_load_error or "Model not loaded."}), 400 threshold = float(request.form.get("threshold", DEFAULT_THRESHOLD)) smoothing = request.form.get("smoothing", str(APPLY_SMOOTHING)).lower() in ("1","true","yes") files = request.files.getlist("files") results = [] for f in files: img = Image.open(f.stream) label, conf, is_sure, probs = predict_with_confidence_pil(img, threshold, smoothing) results.append({ "filename": f.filename, "digit": None if not is_sure else label, "raw_digit": label, "confidence": conf, "is_sure": is_sure, "probs": probs }) return jsonify({"results": results}) except Exception as e: return jsonify({"error": str(e)}), 400 # New: predict + append (atomic) @app.route("/predict_and_append", methods=["POST"]) def predict_and_append(): """ Accepts same body as predict_draw; if digit predicted confidently, append to session expression. Returns the prediction and updated expression. """ try: if model is None: return jsonify({"error": model_load_error or "Model not loaded."}), 400 data = request.get_json(force=True) data_url = data.get("image") threshold = float(data.get("threshold", DEFAULT_THRESHOLD)) smoothing = bool(data.get("smoothing", APPLY_SMOOTHING)) header, b64data = data_url.split(",", 1) img_bytes = base64.b64decode(b64data) img = Image.open(io.BytesIO(img_bytes)) label, conf, is_sure, probs = predict_with_confidence_pil(img, threshold, smoothing) # ensure session key exists expr = session.get("expression", "") appended = False if is_sure: expr = expr + str(label) session["expression"] = expr appended = True return jsonify({ "digit": None if not is_sure else label, "raw_digit": label, "confidence": conf, "is_sure": is_sure, "probs": probs, "appended": appended, "expression": expr }) except Exception as e: return jsonify({"error": str(e)}), 400 # Append symbol (operators or digits) via API (centralized) @app.route("/append_symbol", methods=["POST"]) def append_symbol(): try: data = request.get_json(force=True) symbol = data.get("symbol", "") if not isinstance(symbol, str) or not symbol: return jsonify({"error": "Missing symbol"}), 400 # normalize common display operators symbol = symbol.replace("×", "*").replace("÷", "/").replace("^", "**") # one more validation: only allow small set of tokens allowed = set("0123456789+-*/()%. ") test = symbol.replace("**", "") # remove power token before checking allowed chars if not all(ch in allowed for ch in test): return jsonify({"error": "Invalid symbol"}), 400 expr = session.get("expression", "") expr = expr + symbol session["expression"] = expr return jsonify({"expression": expr}) except Exception as e: return jsonify({"error": str(e)}), 400 @app.route("/clear_expression", methods=["POST"]) def clear_expression(): try: session["expression"] = "" return jsonify({"expression": ""}) except Exception as e: return jsonify({"error": str(e)}), 400 @app.route("/get_expression", methods=["GET"]) def get_expression(): try: expr = session.get("expression", "") return jsonify({"expression": expr}) except Exception as e: return jsonify({"error": str(e)}), 400 @app.route("/evaluate_expression", methods=["POST"]) def evaluate_expression(): try: # Check if an expression was supplied in the body, otherwise use session one data = request.get_json(force=True) if request.data else {} expr = data.get("expression", None) if expr is None: expr = session.get("expression", "") # evaluate safely result = evaluate_expression_safely(expr) # optionally clear expression or keep it — we keep it (client can clear explicitly) return jsonify({"expression": expr, "result": result}) except Exception as e: return jsonify({"error": str(e)}), 400 def segment_digits(image): """ Takes a binary canvas image and segments into individual digits. Returns list of digit images (28x28). """ # Convert to grayscale gray = cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY) # Threshold _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU) # Find contours (each digit) contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE) digit_imgs = [] boxes = [] for cnt in contours: x, y, w, h = cv2.boundingRect(cnt) if w*h > 100: # ignore tiny noise boxes.append((x, y, w, h)) # Sort left-to-right boxes = sorted(boxes, key=lambda b: b[0]) for (x, y, w, h) in boxes: digit = thresh[y:y+h, x:x+w] # Pad to square pad = abs(h - w) // 2 if h > w: digit = cv2.copyMakeBorder(digit, 0, 0, pad, pad, cv2.BORDER_CONSTANT, value=0) else: digit = cv2.copyMakeBorder(digit, pad, pad, 0, 0, cv2.BORDER_CONSTANT, value=0) # Resize to MNIST format digit = cv2.resize(digit, (28, 28), interpolation=cv2.INTER_AREA) digit = digit.astype("float32") / 255.0 digit = np.expand_dims(digit, axis=(0, -1)) # (1, 28, 28, 1) digit_imgs.append(digit) return digit_imgs @app.route("/predict", methods=["POST"]) def predict(): file = request.files['file'].read() npimg = np.frombuffer(file, np.uint8) img = cv2.imdecode(npimg, cv2.IMREAD_UNCHANGED) # Segment digits digits = segment_digits(img) preds = [] for d in digits: prediction = model.predict(d) preds.append(str(np.argmax(prediction))) result = "".join(preds) # e.g., "123" return jsonify({"prediction": result}) if __name__ == "__main__": print("[INFO] Starting Flask app (prediction-only).") app.run(debug=True)
+
+
+----------------------------
+everything fine expect file delete-----
+-------------------
+------
+
+[]
+    
+    for d in digits:
+        prediction = model.predict(d)
+        preds.append(str(np.argmax(prediction)))
+    
+    result = "".join(preds)  # e.g., "123"
+    
+    return jsonify({"prediction": result})
+
+if __name__ == "__main__":
+    print("[INFO] Starting Flask app (prediction-only).")
+    app.run(debug=True)
+
+-----------------------------------
+--------------------------
+----index----
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Digit Recognizer — Full</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>🧠 Handwritten Digit Recognizer</h1>
+  <div class="controls">
+    <label class="switch">
+      <input id="themeToggle" type="checkbox">
+      <span class="slider"></span>
+    </label>
+    <span id="themeLabel">Light</span>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Draw a Digit</h2>
+    <p class="hint">How: <strong>click & drag</strong> or <strong>touch & drag</strong>. Use Download to save your sketch.</p>
+    <div class="canvas-row">
+      <canvas id="drawCanvas" width="280" height="280" aria-label="Drawing area"></canvas>
+      <div class="canvas-buttons">
+        <label>Confidence threshold:
+          <input id="threshold" type="number" min="0" max="1" step="0.01" value="0.7">
+        </label>
+        <label><input id="smoothing" type="checkbox" checked> Server smoothing</label>
+        <button id="clearBtn" type="button">Clear</button>
+        <button id="downloadBtn" type="button">Download</button>
+        <button id="predictBtn" type="button">Predict</button>
+        <button id="saveGalleryBtn" type="button">Save to Gallery</button>
+      </div>
+    </div>
+    <div id="drawResult" class="result"></div>
+  </section>
+
+  <section class="card">
+    <h2>Upload Multiple Images</h2>
+    <form id="uploadForm">
+      <input id="files" type="file" accept="image/*" multiple />
+      <div class="row small">
+        <label>Confidence threshold:
+          <input id="thresholdUpload" type="number" min="0" max="1" step="0.01" value="0.7">
+        </label>
+        <label><input id="smoothingUpload" type="checkbox" checked> Server smoothing</label>
+      </div>
+      <button type="submit">Predict All</button>
+    </form>
+    <div id="grid" class="grid"></div>
+  </section>
+
+  <section class="card">
+    <h2>Gallery (Saved Drawings)</h2>
+    <p class="hint">Saved drawings persist in your browser. Click a thumbnail to open preview / download. Use the delete button to remove individual items.</p>
+    <div id="gallery" class="grid"></div>
+    <div style="margin-top:8px;">
+      <button id="clearGallery">Clear Gallery</button>
+    </div>
+  </section>
+
+  <!-- Handwriting Calculator -->
+  <section class="card">
+    <h2>Handwriting Calculator</h2>
+    <p class="hint">Draw digits. Use buttons for operators. Build an expression and evaluate it. Digits are appended from handwriting prediction; operators are appended via buttons.</p>
+    
+    <div class="canvas-row">
+      <canvas id="calcCanvas" width="280" height="280"></canvas>
+      <div class="canvas-buttons">
+        <button id="calcClearBtn" type="button">Clear</button>
+        <button id="calcAddBtn" type="button">Add Digit</button>
+        <button id="calcClearExpr" type="button">Clear Expression</button>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:10px;">
+      <input id="calcExpr" type="text" readonly placeholder="Expression will appear here" style="flex:1; padding:8px; border-radius:8px; border:1px solid #ddd;">
+      <button id="calcEvalBtn" type="button">Evaluate</button>
+    </div>
+
+    <div class="row" style="margin-top:10px; flex-wrap:wrap;">
+      <button class="op-btn" data-op="+">+</button>
+      <button class="op-btn" data-op="-">−</button>
+      <button class="op-btn" data-op="*">×</button>
+      <button class="op-btn" data-op="/">÷</button>
+      <button class="op-btn" data-op="**">^</button>
+      <button class="op-btn" data-op="(">(</button>
+      <button class="op-btn" data-op=")">)</button>
+      <button class="op-btn" data-op=".">.</button>
+      <button id="calcBackspace" type="button">Backspace</button>
+    </div>
+
+    <div id="calcResult" class="result" style="margin-top:10px;"></div>
+  </section>
+</main>
+
+<!-- Modal for image preview -->
+<div id="modal" class="modal hidden">
+  <div class="modal-content">
+    <button id="modalClose" class="modal-close">✕</button>
+    <img id="modalImg" src="" alt="Preview">
+    <div class="modal-meta">
+      <button id="modalDownload">Download</button>
+      <!-- NEW: delete button inside modal -->
+      <button id="modalDelete" class="delete-btn">Delete</button>
+    </div>
+  </div>
+</div>
+
+<footer>
+  <p>Tip: If model isn't loaded server-side you'll receive a JSON error—run the trainer or put your `trained_model.h5` in project root.</p>
+</footer>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
+--------app.js---
+// static/app.js
+// Handles drawing, canvas predict, gallery, uploads, modal preview, and calculator
+
+// Theme
+const themeToggle = document.getElementById('themeToggle');
+const themeLabel = document.getElementById('themeLabel');
+function setTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  themeLabel.textContent = t[0].toUpperCase() + t.slice(1);
+  localStorage.setItem('theme', t);
+  themeToggle.checked = (t === 'dark');
+}
+setTheme(localStorage.getItem('theme') || 'light');
+themeToggle.addEventListener('change', () => setTheme(themeToggle.checked ? 'dark' : 'light'));
+
+// Canvas (main)
+const canvas = document.getElementById('drawCanvas');
+const ctx = canvas.getContext('2d');
+canvas.width = 280; canvas.height = 280;
+function resetCanvas() {
+  ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.strokeStyle = '#000000'; ctx.lineWidth = 20; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+}
+resetCanvas();
+
+let drawing=false, lastX=0, lastY=0;
+function getPos(e){
+  const rect = canvas.getBoundingClientRect();
+  const isTouch = e.touches && e.touches.length;
+  const clientX = isTouch ? e.touches[0].clientX : e.clientX;
+  const clientY = isTouch ? e.touches[0].clientY : e.clientY;
+  return { x: clientX - rect.left, y: clientY - rect.top };
+}
+function startDraw(e){ e.preventDefault(); drawing=true; const p=getPos(e); lastX=p.x; lastY=p.y; }
+function moveDraw(e){ if(!drawing) return; e.preventDefault(); const p=getPos(e); ctx.beginPath(); ctx.moveTo(lastX,lastY); ctx.lineTo(p.x,p.y); ctx.stroke(); lastX=p.x; lastY=p.y; }
+function endDraw(e){ if(!drawing) return; e.preventDefault(); drawing=false; ctx.beginPath(); }
+
+canvas.addEventListener('mousedown', startDraw);
+canvas.addEventListener('mousemove', moveDraw);
+canvas.addEventListener('mouseup', endDraw);
+canvas.addEventListener('mouseleave', endDraw);
+canvas.addEventListener('touchstart', startDraw, {passive:false});
+canvas.addEventListener('touchmove', moveDraw, {passive:false});
+canvas.addEventListener('touchend', endDraw);
+
+// Buttons (main)
+document.getElementById('clearBtn').addEventListener('click', () => { resetCanvas(); document.getElementById('drawResult').innerHTML=''; });
+document.getElementById('downloadBtn').addEventListener('click', () => {
+  const a = document.createElement('a'); a.href = canvas.toDataURL('image/png'); a.download='digit.png'; a.click();
+});
+
+// Predict canvas (non-calculator)
+document.getElementById('predictBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('predictBtn');
+  btn.disabled=true; btn.textContent='Predicting...';
+  try {
+    const threshold = parseFloat(document.getElementById('threshold').value || '0.7');
+    const smoothing = document.getElementById('smoothing') ? document.getElementById('smoothing').checked : true;
+    const dataURL = canvas.toDataURL('image/png');
+    const res = await fetch('/predict_draw', {
+      method:'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ image: dataURL, threshold, smoothing })
+    });
+    const data = await res.json();
+    const out = document.getElementById('drawResult');
+    if (data.error) {
+      out.innerHTML = `<div class="error">Error: ${data.error}</div>`;
+    } else {
+      const pct = (data.confidence*100).toFixed(1);
+      const shown = data.is_sure ? data.raw_digit : 'Not Sure';
+      out.innerHTML = `<div class="pred"><div class="big">${shown}</div><div>Confidence: ${pct}%</div><details><summary>Class probs</summary><pre>${JSON.stringify(data.probs,null,2)}</pre></details></div>`;
+    }
+  } catch (e) {
+    document.getElementById('drawResult').innerHTML = `<div class="error">Error: ${e}</div>`;
+  } finally {
+    btn.disabled=false; btn.textContent='Predict';
+  }
+});
+
+// Save to gallery (localStorage)
+const GALLERY_KEY = 'digit_gallery_v1';
+function loadGallery(){ try { return JSON.parse(localStorage.getItem(GALLERY_KEY) || '[]'); } catch(e){ return []; } }
+function saveGallery(arr){ localStorage.setItem(GALLERY_KEY, JSON.stringify(arr)); }
+
+/**
+ * renderGallery()
+ * - shows each saved dataURL (newest first)
+ * - renders an "Open" button and a per-item delete overlay button
+ */
+function renderGallery(){
+  const gallery = document.getElementById('gallery');
+  gallery.innerHTML = '';
+  const items = loadGallery();
+  if (!items.length) {
+    gallery.innerHTML = `<div class="predline" style="color:var(--muted)">No saved drawings yet.</div>`;
+    return;
+  }
+
+  items.forEach((dataURL, idx) => {
+    // grid-item structure matches your CSS .grid-item/.thumb/.meta
+    const div = document.createElement('div');
+    div.className = 'grid-item';
+    div.dataset.idx = idx;
+
+    // create thumb area with delete overlay
+    const thumb = document.createElement('div');
+    thumb.className = 'thumb';
+    const img = document.createElement('img');
+    img.id = `gimg-${idx}`;
+    img.src = dataURL;
+    img.alt = `Saved ${idx+1}`;
+    img.style.cursor = 'pointer';
+    // clicking the image opens modal too
+    img.addEventListener('click', () => openModalByIndex(idx));
+
+    const deleteOverlay = document.createElement('button');
+    deleteOverlay.className = 'delete-overlay';
+    deleteOverlay.title = 'Delete';
+    deleteOverlay.innerText = '✕';
+    deleteOverlay.dataset.idx = idx;
+    deleteOverlay.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      deleteGalleryItem(parseInt(ev.currentTarget.dataset.idx, 10));
+    });
+
+    thumb.appendChild(img);
+    thumb.appendChild(deleteOverlay);
+
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.innerHTML = `<div class="fn">Saved ${idx+1}</div>
+                      <div class="predline"><button data-idx="${idx}" class="openBtn">Open</button></div>`;
+
+    div.appendChild(thumb);
+    div.appendChild(meta);
+    gallery.appendChild(div);
+  });
+}
+
+document.getElementById('saveGalleryBtn').addEventListener('click', () => {
+  const dataURL = canvas.toDataURL('image/png');
+  const items = loadGallery();
+  items.unshift(dataURL); // newest first
+  if (items.length > 50) items.pop();
+  saveGallery(items);
+  renderGallery();
+});
+document.getElementById('clearGallery').addEventListener('click', () => { localStorage.removeItem(GALLERY_KEY); renderGallery(); });
+
+// Modal preview
+const modal = document.getElementById('modal');
+const modalImg = document.getElementById('modalImg');
+const modalClose = document.getElementById('modalClose');
+const modalDownload = document.getElementById('modalDownload');
+const modalDelete = document.getElementById('modalDelete');
+
+// keep track of which index is currently shown in modal
+let modalCurrentIndex = null;
+
+function openModalByIndex(idx){
+  const items = loadGallery();
+  if (idx < 0 || idx >= items.length) return;
+  modalCurrentIndex = idx;
+  modalImg.src = items[idx];
+  modal.classList.remove('hidden');
+  modalDownload.onclick = () => { const a=document.createElement('a'); a.href = modalImg.src; a.download='image.png'; a.click(); };
+  // modalDelete handled separately
+}
+
+function openModalWithSrc(src){
+  // find index by src
+  const items = loadGallery();
+  const idx = items.indexOf(src);
+  if (idx >= 0) {
+    openModalByIndex(idx);
+  } else {
+    // fallback: show src but modalCurrentIndex=null (delete won't be available)
+    modalCurrentIndex = null;
+    modalImg.src = src;
+    modal.classList.remove('hidden');
+  }
+}
+
+modalClose.addEventListener('click', ()=> { modal.classList.add('hidden'); modalCurrentIndex = null; });
+modal.addEventListener('click', (e) => { if (e.target === modal) { modal.classList.add('hidden'); modalCurrentIndex = null; } });
+
+// modal delete button: deletes the currently previewed item
+modalDelete.addEventListener('click', () => {
+  if (modalCurrentIndex === null) return;
+  deleteGalleryItem(modalCurrentIndex);
+  modal.classList.add('hidden');
+  modalCurrentIndex = null;
+});
+
+/**
+ * deleteGalleryItem(index)
+ * - removes item at index from gallery (localStorage), re-renders
+ */
+function deleteGalleryItem(index) {
+  const items = loadGallery();
+  if (index < 0 || index >= items.length) return;
+  items.splice(index, 1);
+  saveGallery(items);
+  renderGallery();
+}
+
+// open buttons delegate (in case old markup used openBtn)
+document.body.addEventListener('click', (e) => {
+  if (e.target.classList.contains('openBtn')) {
+    const idx = parseInt(e.target.dataset.idx, 10);
+    const items = loadGallery();
+    openModalByIndex(idx);
+  }
+});
+
+// Upload & predict files (grid + popup on click)
+document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const grid = document.getElementById('grid'); grid.innerHTML='';
+  const files = document.getElementById('files').files;
+  if (!files.length) return;
+  const threshold = parseFloat(document.getElementById('thresholdUpload').value || '0.7');
+  const smoothing = document.getElementById('smoothingUpload') ? document.getElementById('smoothingUpload').checked : true;
+  const fd = new FormData();
+  for (const f of files) fd.append('files', f);
+  fd.append('threshold', threshold);
+  fd.append('smoothing', smoothing ? 'true' : 'false');
+
+  const res = await fetch('/predict_files', { method:'POST', body: fd });
+  const data = await res.json();
+  if (data.error) { grid.innerHTML = `<div class="error">Error: ${data.error}</div>`; return; }
+  data.results.forEach((item, idx) => {
+    const pct = (item.confidence*100).toFixed(1);
+    const label = item.is_sure ? item.raw_digit : 'Not Sure';
+    const card = document.createElement('div'); card.className='grid-item';
+    card.innerHTML = `<div class="thumb"><img id="upimg-${idx}" alt=""></div><div class="meta"><div class="fn" title="${item.filename}">${item.filename}</div><div class="predline"><strong>${label}</strong> — ${pct}%</div><details><summary>Probs</summary><pre>${JSON.stringify(item.probs,null,2)}</pre></details></div>`;
+    grid.appendChild(card);
+  });
+  // show thumbnails
+  [...files].forEach((f, idx) => {
+    const url = URL.createObjectURL(f);
+    const img = document.getElementById(`upimg-${idx}`);
+    img.src = url;
+    img.addEventListener('click', () => openModalWithSrc(url));
+    img.onload = () => URL.revokeObjectURL(url);
+  });
+});
+
+// initial render
+renderGallery();
+
+// ----------------- Calculator (client-side, server-centralized expr) -----------------
+// (unchanged; using your previously-provided code — kept intact)
+
+const calcCanvas = document.getElementById('calcCanvas');
+const calcCtx = calcCanvas.getContext('2d');
+calcCanvas.width = 280; calcCanvas.height = 280;
+function resetCalcCanvas() {
+  calcCtx.fillStyle = '#ffffff';
+  calcCtx.fillRect(0,0,calcCanvas.width,calcCanvas.height);
+  calcCtx.strokeStyle = '#000000';
+  calcCtx.lineWidth = 20;
+  calcCtx.lineCap = 'round';
+  calcCtx.lineJoin = 'round';
+}
+resetCalcCanvas();
+
+let calcDrawing = false, calcLastX=0, calcLastY=0;
+function calcGetPos(e){ const r = calcCanvas.getBoundingClientRect(); const x=(e.touches?e.touches[0].clientX:e.clientX)-r.left; const y=(e.touches?e.touches[0].clientY:e.clientY)-r.top; return {x,y}; }
+function calcStart(e){ e.preventDefault(); calcDrawing=true; const p=calcGetPos(e); calcLastX=p.x; calcLastY=p.y; }
+function calcMove(e){ if(!calcDrawing) return; e.preventDefault(); const p=calcGetPos(e); calcCtx.beginPath(); calcCtx.moveTo(calcLastX,calcLastY); calcCtx.lineTo(p.x,p.y); calcCtx.stroke(); calcLastX=p.x; calcLastY=p.y; }
+function calcEnd(e){ if(!calcDrawing) return; e.preventDefault(); calcDrawing=false; calcCtx.beginPath(); }
+
+calcCanvas.addEventListener('mousedown', calcStart);
+calcCanvas.addEventListener('mousemove', calcMove);
+calcCanvas.addEventListener('mouseup', calcEnd);
+calcCanvas.addEventListener('mouseleave', calcEnd);
+calcCanvas.addEventListener('touchstart', calcStart, {passive:false});
+calcCanvas.addEventListener('touchmove', calcMove, {passive:false});
+calcCanvas.addEventListener('touchend', calcEnd);
+
+document.getElementById('calcClearBtn').addEventListener('click', () => { resetCalcCanvas(); });
+
+// helper: refresh expression display from server
+async function refreshExpressionDisplay(){
+  const res = await fetch('/get_expression');
+  const data = await res.json();
+  if (data.expression !== undefined) {
+    document.getElementById('calcExpr').value = data.expression;
+  }
+}
+refreshExpressionDisplay();
+
+// Add digit (predict on server and append atomically)
+document.getElementById('calcAddBtn').addEventListener('click', async () => {
+  const dataURL = calcCanvas.toDataURL('image/png');
+  const threshold = parseFloat(document.getElementById('threshold').value || '0.7');
+  const smoothing = document.getElementById('smoothing') ? document.getElementById('smoothing').checked : true;
+  
+  const res = await fetch('/predict_and_append', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ image: dataURL, threshold, smoothing })
+  });
+  const data = await res.json();
+  
+  if (data.error) {
+    alert("Prediction error: " + data.error);
+    return;
+  }
+
+  if (data.is_sure) {
+    // server returned updated expression
+    document.getElementById('calcExpr').value = data.expression || "";
+  } else {
+    alert("Uncertain digit prediction. Please redraw.");
+  }
+  resetCalcCanvas();
+});
+
+// Operator buttons -> append symbol on server
+document.querySelectorAll('.op-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const op = btn.dataset.op;
+    const res = await fetch('/append_symbol', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ symbol: op })
+    });
+    const data = await res.json();
+    if (data.error) {
+      alert("Could not append operator: " + data.error);
+      return;
+    }
+    document.getElementById('calcExpr').value = data.expression || "";
+  });
+});
+
+// Backspace (client-side convenience: request server to remove last char)
+document.getElementById('calcBackspace').addEventListener('click', async () => {
+  const g = await fetch('/get_expression'); const dg = await g.json();
+  if (dg.error) { alert(dg.error); return; }
+  let expr = dg.expression || "";
+  if (!expr) return;
+  expr = expr.slice(0, -1);
+  await fetch('/clear_expression', { method:'POST' });
+  if (expr.length) {
+    await fetch('/append_symbol', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ symbol: expr })
+    });
+  }
+  await refreshExpressionDisplay();
+});
+
+// Clear expression (server-side)
+document.getElementById('calcClearExpr').addEventListener('click', async () => {
+  const res = await fetch('/clear_expression', { method:'POST' });
+  const data = await res.json();
+  if (data.error) { alert("Error clearing expression: " + data.error); return; }
+  document.getElementById('calcExpr').value = data.expression;
+});
+
+// Evaluate expression (server-side)
+document.getElementById('calcEvalBtn').addEventListener('click', async () => {
+  const res = await fetch('/evaluate_expression', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({})
+  });
+  const data = await res.json();
+  const out = document.getElementById('calcResult');
+  if (data.error) {
+    out.innerHTML = `<div class="error">${data.error}</div>`;
+  } else {
+    out.innerHTML = `<div class="pred"><div class="big">${data.result}</div><div>from ${data.expression}</div></div>`;
+  }
+  await refreshExpressionDisplay();
+});
+-------css----
+:root {
+  --bg: #ffffff;
+  --fg: #111827;
+  --muted: #6b7280;
+  --card: #f9fafb;
+  --accent: #2563eb;
+  --accent-contrast: #ffffff;
+  --border: #e5e7eb;
+}
+:root[data-theme="dark"] {
+  --bg: #0b0f19;
+  --fg: #e5e7eb;
+  --muted: #9ca3af;
+  --card: #111827;
+  --accent: #60a5fa;
+  --accent-contrast: #0b0f19;
+  --border: #1f2937;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+header, footer {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 16px 20px;
+}
+header { display:flex; align-items:center; justify-content:space-between; }
+h1 { margin:0; font-size:1.4rem; }
+h2 { margin:0 0 12px; }
+.hint { margin: 6px 0 12px; color: var(--muted); }
+
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 8px 20px 40px;
+  display: grid;
+  gap: 16px;
+  grid-template-columns: 1fr 1fr;
+}
+@media (max-width: 960px){ main{ grid-template-columns:1fr; } }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 16px;
+  box-shadow: 0 2px 10px rgb(0 0 0 / 6%);
+}
+
+.canvas-row { display:flex; gap:16px; align-items:flex-start; }
+canvas {
+  border: 2px dashed var(--border);
+  border-radius: 12px;
+  background: #ffffff;
+  width: 280px; height: 280px;
+  touch-action: none;
+}
+
+.canvas-buttons { display:flex; flex-direction:column; gap:8px; }
+.row { display:flex; gap:12px; align-items:center; }
+small { font-size: 0.85rem; color: var(--muted); }
+
+button {
+  appearance: none; border: none;
+  background: var(--accent); color: var(--accent-contrast);
+  padding: 8px 12px; border-radius: 10px; font-weight: 600; cursor: pointer;
+}
+button[disabled]{ opacity: .6; cursor: default; }
+
+input[type="number"]{
+  width: 120px; padding: 6px 8px; border-radius: 8px; border:1px solid var(--border);
+  background: var(--bg); color: var(--fg);
+}
+input[type="file"]{ display:block; margin:8px 0 10px; }
+
+.result .big{ font-size: 40px; font-weight: 800; margin-bottom: 6px; }
+.pred{
+  background: rgba(0,0,0,0.04); padding:10px; border-radius:12px; border:1px solid var(--border);
+}
+:root[data-theme="dark"] .pred { background: rgba(255,255,255,0.05); }
+
+.grid {
+  display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+}
+.grid-item{
+  display:grid; grid-template-columns: 90px 1fr; gap:10px;
+  background: var(--bg); border:1px solid var(--border);
+  border-radius:12px; padding:10px;
+}
+.thumb{ position: relative; width:90px; height:90px; border-radius:8px; overflow:hidden; display:flex; align-items:center; justify-content:center; background:#fff; border:1px dashed var(--border); }
+.thumb img{ max-width:100%; max-height:100%; }
+.meta .fn{ font-weight:600; margin-bottom:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.predline{ color: var(--muted); }
+
+/* Delete button overlay on each saved thumbnail */
+.thumb .delete-overlay {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: rgba(239,68,68,0.95);
+  border: none;
+  color: white;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:14px;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+}
+.thumb .delete-overlay:hover { transform: translateY(-1px); }
+
+/* Modal delete button */
+.modal-meta { display:flex; gap:8px; justify-content:center; margin-top:8px; }
+.delete-btn {
+  background: #ef4444;
+  color: #fff;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+}
+.delete-btn:hover { opacity: 0.95; }
+
+.error{
+  color:#ef4444; font-weight:600; padding:8px 10px;
+  background: rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.2); border-radius:10px;
+}
+
+/* Modal */
+.modal { position: fixed; inset: 0; display:flex; align-items:center; justify-content:center; background: rgba(0,0,0,0.5); z-index: 2000; }
+.modal.hidden { display: none; }
+.modal-content {
+  background: var(--card); padding: 12px; border-radius: 12px; max-width: 90vw; max-height: 90vh; overflow: auto;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+  position: relative;
+}
+.modal img { max-width: 80vw; max-height: 70vh; display:block; margin: 0 auto; }
+.modal-close { position:absolute; right:8px; top:8px; background:transparent; border:none; font-size:18px; cursor:pointer; }
+
+/* Theme switcher */
+.switch { position: relative; display: inline-block; width: 52px; height: 28px; }
+.switch input { display:none; }
+.slider { position: absolute; cursor: pointer; inset:0; background:#ccc; transition:.2s; border-radius:28px; }
+.slider:before { content:""; position:absolute; height:22px; width:22px; left:3px; bottom:3px; background:#fff; transition:.2s; border-radius:50%; }
+input:checked + .slider { background: var(--accent); }
+input:checked + .slider:before { transform: translateX(24px); }
+-----------------------------------
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Digit Recognizer — Full</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header>
+  <h1>🧠 Handwritten Digit Recognizer</h1>
+  <div class="controls">
+    <label class="switch">
+      <input id="themeToggle" type="checkbox">
+      <span class="slider"></span>
+    </label>
+    <span id="themeLabel">Light</span>
+  </div>
+</header>
+
+<main>
+  <section class="card">
+    <h2>Draw a Digit</h2>
+    <p class="hint">How: <strong>click & drag</strong> or <strong>touch & drag</strong>. Use Download to save your sketch.</p>
+    <div class="canvas-row">
+      <canvas id="drawCanvas" width="280" height="280" aria-label="Drawing area"></canvas>
+      <div class="canvas-buttons">
+        <label>Confidence threshold:
+          <input id="threshold" type="number" min="0" max="1" step="0.01" value="0.7">
+        </label>
+        <label><input id="smoothing" type="checkbox" checked> Server smoothing</label>
+        <button id="clearBtn" type="button">Clear</button>
+        <button id="downloadBtn" type="button">Download</button>
+        <button id="predictBtn" type="button">Predict</button>
+        <button id="saveGalleryBtn" type="button">Save to Gallery</button>
+      </div>
+    </div>
+    <div id="drawResult" class="result"></div>
+  </section>
+
+  <section class="card">
+    <h2>Upload Multiple Images (Predict)</h2>
+    <form id="uploadForm">
+      <input id="files" type="file" accept="image/*" multiple />
+      <div class="row small">
+        <label>Confidence threshold:
+          <input id="thresholdUpload" type="number" min="0" max="1" step="0.01" value="0.7">
+        </label>
+        <label><input id="smoothingUpload" type="checkbox" checked> Server smoothing</label>
+      </div>
+      <button type="submit">Predict All</button>
+    </form>
+    <div id="grid" class="grid"></div>
+  </section>
+
+  <section class="card">
+    <h2>Saved Uploads (Server)</h2>
+    <p class="hint">Upload files to the server here. Preview or delete saved files.</p>
+    <input id="fileInput" type="file" multiple />
+    <div id="fileList" class="grid" style="margin-top:8px;"></div>
+  </section>
+
+  <section class="card">
+    <h2>Gallery (Saved Drawings)</h2>
+    <p class="hint">Saved drawings persist in your browser. Click a thumbnail to open preview / download. Use the delete button to remove individual items.</p>
+    <div id="gallery" class="grid"></div>
+    <div style="margin-top:8px;">
+      <button id="clearGallery">Clear Gallery</button>
+    </div>
+  </section>
+
+  <!-- Handwriting Calculator -->
+  <section class="card">
+    <h2>Handwriting Calculator</h2>
+    <p class="hint">Draw digits. Use buttons for operators. Build an expression and evaluate it. Digits are appended from handwriting prediction; operators are appended via buttons.</p>
+    
+    <div class="canvas-row">
+      <canvas id="calcCanvas" width="280" height="280"></canvas>
+      <div class="canvas-buttons">
+        <button id="calcClearBtn" type="button">Clear</button>
+        <button id="calcAddBtn" type="button">Add Digit</button>
+        <button id="calcClearExpr" type="button">Clear Expression</button>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:10px;">
+      <input id="calcExpr" type="text" readonly placeholder="Expression will appear here" style="flex:1; padding:8px; border-radius:8px; border:1px solid #ddd;">
+      <button id="calcEvalBtn" type="button">Evaluate</button>
+    </div>
+
+    <div class="row" style="margin-top:10px; flex-wrap:wrap;">
+      <button class="op-btn" data-op="+">+</button>
+      <button class="op-btn" data-op="-">−</button>
+      <button class="op-btn" data-op="*">×</button>
+      <button class="op-btn" data-op="/">÷</button>
+      <button class="op-btn" data-op="**">^</button>
+      <button class="op-btn" data-op="(">(</button>
+      <button class="op-btn" data-op=")">)</button>
+      <button class="op-btn" data-op=".">.</button>
+      <button id="calcBackspace" type="button">Backspace</button>
+    </div>
+
+    <div id="calcResult" class="result" style="margin-top:10px;"></div>
+  </section>
+</main>
+
+<!-- Modal for image preview -->
+<div id="modal" class="modal hidden">
+  <div class="modal-content">
+    <button id="modalClose" class="modal-close">✕</button>
+    <div id="modalBody" style="min-width:240px; min-height:120px; display:flex; align-items:center; justify-content:center;">
+      <img id="modalImg" src="" alt="Preview" style="max-width:80vw; max-height:70vh; display:block;">
+    </div>
+    <div class="modal-meta">
+      <button id="modalDownload">Download</button>
+      <!-- delete works for gallery items OR server files depending on context -->
+      <button id="modalDelete" class="delete-btn">Delete</button>
+    </div>
+  </div>
+</div>
+
+<footer>
+  <p>Tip: If model isn't loaded server-side you'll receive a JSON error—run the trainer or put your `trained_model.h5` in project root.</p>
+</footer>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
+
+
+--script-
+// static/app.js
+// Handles drawing, canvas predict, gallery, uploads, server file manager, modal preview, and calculator
+
+// Theme
+const themeToggle = document.getElementById('themeToggle');
+const themeLabel = document.getElementById('themeLabel');
+function setTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  themeLabel.textContent = t[0].toUpperCase() + t.slice(1);
+  localStorage.setItem('theme', t);
+  themeToggle.checked = (t === 'dark');
+}
+setTheme(localStorage.getItem('theme') || 'light');
+themeToggle.addEventListener('change', () => setTheme(themeToggle.checked ? 'dark' : 'light'));
+
+// Canvas (main)
+const canvas = document.getElementById('drawCanvas');
+const ctx = canvas.getContext('2d');
+canvas.width = 280; canvas.height = 280;
+function resetCanvas() {
+  ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,canvas.width,canvas.height);
+  ctx.strokeStyle = '#000000'; ctx.lineWidth = 20; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+}
+resetCanvas();
+
+let drawing=false, lastX=0, lastY=0;
+function getPos(e){
+  const rect = canvas.getBoundingClientRect();
+  const isTouch = e.touches && e.touches.length;
+  const clientX = isTouch ? e.touches[0].clientX : e.clientX;
+  const clientY = isTouch ? e.touches[0].clientY : e.clientY;
+  return { x: clientX - rect.left, y: clientY - rect.top };
+}
+function startDraw(e){ e.preventDefault(); drawing=true; const p=getPos(e); lastX=p.x; lastY=p.y; }
+function moveDraw(e){ if(!drawing) return; e.preventDefault(); const p=getPos(e); ctx.beginPath(); ctx.moveTo(lastX,lastY); ctx.lineTo(p.x,p.y); ctx.stroke(); lastX=p.x; lastY=p.y; }
+function endDraw(e){ if(!drawing) return; e.preventDefault(); drawing=false; ctx.beginPath(); }
+
+canvas.addEventListener('mousedown', startDraw);
+canvas.addEventListener('mousemove', moveDraw);
+canvas.addEventListener('mouseup', endDraw);
+canvas.addEventListener('mouseleave', endDraw);
+canvas.addEventListener('touchstart', startDraw, {passive:false});
+canvas.addEventListener('touchmove', moveDraw, {passive:false});
+canvas.addEventListener('touchend', endDraw);
+
+// Buttons (main)
+document.getElementById('clearBtn').addEventListener('click', () => { resetCanvas(); document.getElementById('drawResult').innerHTML=''; });
+document.getElementById('downloadBtn').addEventListener('click', () => {
+  const a = document.createElement('a'); a.href = canvas.toDataURL('image/png'); a.download='digit.png'; a.click();
+});
+
+// Predict canvas (non-calculator)
+document.getElementById('predictBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('predictBtn');
+  btn.disabled=true; btn.textContent='Predicting...';
+  try {
+    const threshold = parseFloat(document.getElementById('threshold').value || '0.7');
+    const smoothing = document.getElementById('smoothing') ? document.getElementById('smoothing').checked : true;
+    const dataURL = canvas.toDataURL('image/png');
+    const res = await fetch('/predict_draw', {
+      method:'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ image: dataURL, threshold, smoothing })
+    });
+    const data = await res.json();
+    const out = document.getElementById('drawResult');
+    if (data.error) {
+      out.innerHTML = `<div class="error">Error: ${data.error}</div>`;
+    } else {
+      const pct = (data.confidence*100).toFixed(1);
+      const shown = data.is_sure ? data.raw_digit : 'Not Sure';
+      out.innerHTML = `<div class="pred"><div class="big">${shown}</div><div>Confidence: ${pct}%</div><details><summary>Class probs</summary><pre>${JSON.stringify(data.probs,null,2)}</pre></details></div>`;
+    }
+  } catch (e) {
+    document.getElementById('drawResult').innerHTML = `<div class="error">Error: ${e}</div>`;
+  } finally {
+    btn.disabled=false; btn.textContent='Predict';
+  }
+});
+
+// Save to gallery (localStorage)
+const GALLERY_KEY = 'digit_gallery_v1';
+function loadGallery(){ try { return JSON.parse(localStorage.getItem(GALLERY_KEY) || '[]'); } catch(e){ return []; } }
+function saveGallery(arr){ localStorage.setItem(GALLERY_KEY, JSON.stringify(arr)); }
+
+/**
+ * renderGallery()
+ * - shows each saved dataURL (newest first)
+ * - renders an "Open" button and a per-item delete overlay button
+ */
+function renderGallery(){
+  const gallery = document.getElementById('gallery');
+  gallery.innerHTML = '';
+  const items = loadGallery();
+  if (!items.length) {
+    gallery.innerHTML = `<div class="predline" style="color:var(--muted)">No saved drawings yet.</div>`;
+    return;
+  }
+
+  items.forEach((dataURL, idx) => {
+    // grid-item structure matches your CSS .grid-item/.thumb/.meta
+    const div = document.createElement('div');
+    div.className = 'grid-item';
+    div.dataset.idx = idx;
+
+    // create thumb area with delete overlay
+    const thumb = document.createElement('div');
+    thumb.className = 'thumb';
+    const img = document.createElement('img');
+    img.id = `gimg-${idx}`;
+    img.src = dataURL;
+    img.alt = `Saved ${idx+1}`;
+    img.style.cursor = 'pointer';
+    // clicking the image opens modal too
+    img.addEventListener('click', () => openModalByIndex(idx));
+
+    const deleteOverlay = document.createElement('button');
+    deleteOverlay.className = 'delete-overlay';
+    deleteOverlay.title = 'Delete';
+    deleteOverlay.innerText = '✕';
+    deleteOverlay.dataset.idx = idx;
+    deleteOverlay.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      deleteGalleryItem(parseInt(ev.currentTarget.dataset.idx, 10));
+    });
+
+    thumb.appendChild(img);
+    thumb.appendChild(deleteOverlay);
+
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.innerHTML = `<div class="fn">Saved ${idx+1}</div>
+                      <div class="predline"><button data-idx="${idx}" class="openBtn">Open</button></div>`;
+
+    div.appendChild(thumb);
+    div.appendChild(meta);
+    gallery.appendChild(div);
+  });
+}
+
+document.getElementById('saveGalleryBtn').addEventListener('click', () => {
+  const dataURL = canvas.toDataURL('image/png');
+  const items = loadGallery();
+  items.unshift(dataURL); // newest first
+  if (items.length > 50) items.pop();
+  saveGallery(items);
+  renderGallery();
+});
+document.getElementById('clearGallery').addEventListener('click', () => { localStorage.removeItem(GALLERY_KEY); renderGallery(); });
+
+// Modal preview
+const modal = document.getElementById('modal');
+const modalImg = document.getElementById('modalImg');
+const modalClose = document.getElementById('modalClose');
+const modalDownload = document.getElementById('modalDownload');
+const modalDelete = document.getElementById('modalDelete');
+
+// Context tracking: gallery index OR server filename
+let modalCurrentGalleryIndex = null;
+let modalServerFilename = null;
+
+function openModalByIndex(idx){
+  const items = loadGallery();
+  if (idx < 0 || idx >= items.length) return;
+  modalCurrentGalleryIndex = idx;
+  modalServerFilename = null;
+  modalImg.src = items[idx];
+  modal.classList.remove('hidden');
+  modalDownload.onclick = () => { const a=document.createElement('a'); a.href = modalImg.src; a.download='image.png'; a.click(); };
+}
+
+function openModalWithSrc(src){
+  // used for objectURLs (uploaded preview) or arbitrary images
+  modalCurrentGalleryIndex = null;
+  modalServerFilename = null;
+  modalImg.src = src;
+  modal.classList.remove('hidden');
+  modalDownload.onclick = () => { const a=document.createElement('a'); a.href = src; a.download='image.png'; a.click(); };
+}
+
+function openServerPreview(filename){
+  modalCurrentGalleryIndex = null;
+  modalServerFilename = filename;
+  // encode filename for URL usage
+  modalImg.src = '/uploads/' + encodeURIComponent(filename);
+  modal.classList.remove('hidden');
+  modalDownload.onclick = () => { const a=document.createElement('a'); a.href = modalImg.src; a.download = filename; a.click(); };
+}
+
+modalClose.addEventListener('click', ()=> { modal.classList.add('hidden'); modalCurrentGalleryIndex = null; modalServerFilename = null; });
+modal.addEventListener('click', (e) => { if (e.target === modal) { modal.classList.add('hidden'); modalCurrentGalleryIndex = null; modalServerFilename = null; } });
+
+// modal delete button: deletes gallery item or server file depending on context
+modalDelete.addEventListener('click', async () => {
+  if (modalServerFilename) {
+    // delete server file
+    const filename = modalServerFilename;
+    try {
+      const res = await fetch('/delete_file/' + encodeURIComponent(filename), { method: 'DELETE' });
+      const data = await res.json();
+      if (data.success) {
+        modal.classList.add('hidden');
+        modalServerFilename = null;
+        await refreshServerFiles();
+      } else {
+        alert('Could not delete file: ' + (data.error || 'unknown'));
+      }
+    } catch (e) {
+      alert('Delete failed: ' + e);
+    }
+  } else if (modalCurrentGalleryIndex !== null) {
+    deleteGalleryItem(modalCurrentGalleryIndex);
+    modal.classList.add('hidden');
+    modalCurrentGalleryIndex = null;
+  }
+});
+
+// Delete gallery item
+function deleteGalleryItem(index) {
+  const items = loadGallery();
+  if (index < 0 || index >= items.length) return;
+  items.splice(index, 1);
+  saveGallery(items);
+  renderGallery();
+}
+
+// open buttons delegate (in case old markup used openBtn)
+document.body.addEventListener('click', (e) => {
+  if (e.target.classList.contains('openBtn')) {
+    const idx = parseInt(e.target.dataset.idx, 10);
+    const items = loadGallery();
+    openModalByIndex(idx);
+  }
+});
+
+// Upload & predict files (grid + popup on click)
+document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const grid = document.getElementById('grid'); grid.innerHTML='';
+  const files = document.getElementById('files').files;
+  if (!files.length) return;
+  const threshold = parseFloat(document.getElementById('thresholdUpload').value || '0.7');
+  const smoothing = document.getElementById('smoothingUpload') ? document.getElementById('smoothingUpload').checked : true;
+  const fd = new FormData();
+  for (const f of files) fd.append('files', f);
+  fd.append('threshold', threshold);
+  fd.append('smoothing', smoothing ? 'true' : 'false');
+
+  const res = await fetch('/predict_files', { method:'POST', body: fd });
+  const data = await res.json();
+  if (data.error) { grid.innerHTML = `<div class="error">Error: ${data.error}</div>`; return; }
+  data.results.forEach((item, idx) => {
+    const pct = (item.confidence*100).toFixed(1);
+    const label = item.is_sure ? item.raw_digit : 'Not Sure';
+    const card = document.createElement('div'); card.className='grid-item';
+    card.innerHTML = `<div class="thumb"><img id="upimg-${idx}" alt=""></div><div class="meta"><div class="fn" title="${item.filename}">${item.filename}</div><div class="predline"><strong>${label}</strong> — ${pct}%</div><details><summary>Probs</summary><pre>${JSON.stringify(item.probs,null,2)}</pre></details></div>`;
+    grid.appendChild(card);
+  });
+  // show thumbnails
+  [...files].forEach((f, idx) => {
+    const url = URL.createObjectURL(f);
+    const img = document.getElementById(`upimg-${idx}`);
+    img.src = url;
+    img.addEventListener('click', () => openModalWithSrc(url));
+    img.onload = () => URL.revokeObjectURL(url);
+  });
+});
+
+// initial render
+renderGallery();
+
+// ----------------- Server file manager -----------------
+const fileInput = document.getElementById("fileInput");
+const fileList = document.getElementById("fileList");
+
+async function refreshServerFiles(){
+  const res = await fetch('/list_uploads');
+  const data = await res.json();
+  fileList.innerHTML = '';
+  if (data.files && data.files.length) {
+    data.files.forEach(f => {
+      const item = document.createElement('div');
+      item.className = 'grid-item';
+      // thumb
+      const thumb = document.createElement('div');
+      thumb.className = 'thumb';
+      const ext = f.filename.split('.').pop().toLowerCase();
+      if (['png','jpg','jpeg','gif','webp','bmp'].includes(ext)) {
+        const img = document.createElement('img');
+        img.src = '/uploads/' + encodeURIComponent(f.filename);
+        img.alt = f.filename;
+        img.style.cursor = 'pointer';
+        img.addEventListener('click', () => openServerPreview(f.filename));
+        thumb.appendChild(img);
+      } else {
+        thumb.innerHTML = '<div style="font-size:28px">📄</div>';
+      }
+
+      // meta
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      meta.innerHTML = `<div class="fn" title="${f.filename}">${f.filename}</div><div class="predline">${(f.size/1024).toFixed(1)} KB</div>`;
+
+      // actions
+      const previewBtn = document.createElement('button');
+      previewBtn.textContent = 'Preview';
+      previewBtn.addEventListener('click', () => openServerPreview(f.filename));
+
+      const delBtn = document.createElement('button');
+      delBtn.textContent = 'Delete';
+      delBtn.addEventListener('click', async () => {
+        if (!confirm('Delete ' + f.filename + ' ?')) return;
+        const resp = await fetch('/delete_file/' + encodeURIComponent(f.filename), { method: 'DELETE' });
+        const d = await resp.json();
+        if (d.success) {
+          item.remove();
+        } else {
+          alert('Delete failed: ' + (d.error || 'unknown'));
+        }
+      });
+
+      meta.appendChild(previewBtn);
+      meta.appendChild(delBtn);
+
+      item.appendChild(thumb);
+      item.appendChild(meta);
+      fileList.appendChild(item);
+    });
+  } else {
+    fileList.innerHTML = `<div class="predline" style="color:var(--muted)">No server files yet.</div>`;
+  }
+}
+
+fileInput?.addEventListener('change', async (e) => {
+  const files = Array.from(e.target.files);
+  if (!files.length) return;
+  for (const file of files) {
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await fetch('/upload', { method: 'POST', body: formData });
+    const data = await res.json();
+    if (data.files && data.files.length) {
+      // after upload, refresh list
+      // we only upload one per request in this loop; refresh once after all uploaded
+    } else if (data.error) {
+      alert('Upload error: ' + data.error);
+    }
+  }
+  // reset and refresh
+  fileInput.value = '';
+  await refreshServerFiles();
+});
+
+// initial server files fetch
+refreshServerFiles();
+
+// ----------------- Calculator (client-side, server-centralized expr) -----------------
+const calcCanvas = document.getElementById('calcCanvas');
+const calcCtx = calcCanvas.getContext('2d');
+calcCanvas.width = 280; calcCanvas.height = 280;
+function resetCalcCanvas() {
+  calcCtx.fillStyle = '#ffffff';
+  calcCtx.fillRect(0,0,calcCanvas.width,calcCanvas.height);
+  calcCtx.strokeStyle = '#000000';
+  calcCtx.lineWidth = 20;
+  calcCtx.lineCap = 'round';
+  calcCtx.lineJoin = 'round';
+}
+resetCalcCanvas();
+
+let calcDrawing = false, calcLastX=0, calcLastY=0;
+function calcGetPos(e){ const r = calcCanvas.getBoundingClientRect(); const x=(e.touches?e.touches[0].clientX:e.clientX)-r.left; const y=(e.touches?e.touches[0].clientY:e.clientY)-r.top; return {x,y}; }
+function calcStart(e){ e.preventDefault(); calcDrawing=true; const p=calcGetPos(e); calcLastX=p.x; calcLastY=p.y; }
+function calcMove(e){ if(!calcDrawing) return; e.preventDefault(); const p=calcGetPos(e); calcCtx.beginPath(); calcCtx.moveTo(calcLastX,calcLastY); calcCtx.lineTo(p.x,p.y); calcCtx.stroke(); calcLastX=p.x; calcLastY=p.y; }
+function calcEnd(e){ if(!calcDrawing) return; e.preventDefault(); calcDrawing=false; calcCtx.beginPath(); }
+
+calcCanvas.addEventListener('mousedown', calcStart);
+calcCanvas.addEventListener('mousemove', calcMove);
+calcCanvas.addEventListener('mouseup', calcEnd);
+calcCanvas.addEventListener('mouseleave', calcEnd);
+calcCanvas.addEventListener('touchstart', calcStart, {passive:false});
+calcCanvas.addEventListener('touchmove', calcMove, {passive:false});
+calcCanvas.addEventListener('touchend', calcEnd);
+
+document.getElementById('calcClearBtn').addEventListener('click', () => { resetCalcCanvas(); });
+
+// helper: refresh expression display from server
+async function refreshExpressionDisplay(){
+  const res = await fetch('/get_expression');
+  const data = await res.json();
+  if (data.expression !== undefined) {
+    document.getElementById('calcExpr').value = data.expression;
+  }
+}
+refreshExpressionDisplay();
+
+// Add digit (predict on server and append atomically)
+document.getElementById('calcAddBtn').addEventListener('click', async () => {
+  const dataURL = calcCanvas.toDataURL('image/png');
+  const threshold = parseFloat(document.getElementById('threshold').value || '0.7');
+  const smoothing = document.getElementById('smoothing') ? document.getElementById('smoothing').checked : true;
+  
+  const res = await fetch('/predict_and_append', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ image: dataURL, threshold, smoothing })
+  });
+  const data = await res.json();
+  
+  if (data.error) {
+    alert("Prediction error: " + data.error);
+    return;
+  }
+
+  if (data.is_sure) {
+    // server returned updated expression
+    document.getElementById('calcExpr').value = data.expression || "";
+  } else {
+    alert("Uncertain digit prediction. Please redraw.");
+  }
+  resetCalcCanvas();
+});
+
+// Operator buttons -> append symbol on server
+document.querySelectorAll('.op-btn').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const op = btn.dataset.op;
+    const res = await fetch('/append_symbol', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ symbol: op })
+    });
+    const data = await res.json();
+    if (data.error) {
+      alert("Could not append operator: " + data.error);
+      return;
+    }
+    document.getElementById('calcExpr').value = data.expression || "";
+  });
+});
+
+// Backspace (client-side convenience: request server to remove last char)
+document.getElementById('calcBackspace').addEventListener('click', async () => {
+  const g = await fetch('/get_expression'); const dg = await g.json();
+  if (dg.error) { alert(dg.error); return; }
+  let expr = dg.expression || "";
+  if (!expr) return;
+  expr = expr.slice(0, -1);
+  await fetch('/clear_expression', { method:'POST' });
+  if (expr.length) {
+    await fetch('/append_symbol', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ symbol: expr })
+    });
+  }
+  await refreshExpressionDisplay();
+});
+
+// Clear expression (server-side)
+document.getElementById('calcClearExpr').addEventListener('click', async () => {
+  const res = await fetch('/clear_expression', { method:'POST' });
+  const data = await res.json();
+  if (data.error) { alert("Error clearing expression: " + data.error); return; }
+  document.getElementById('calcExpr').value = data.expression;
+});
+
+// Evaluate expression (server-side)
+document.getElementById('calcEvalBtn').addEventListener('click', async () => {
+  const res = await fetch('/evaluate_expression', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({})
+  });
+  const data = await res.json();
+  const out = document.getElementById('calcResult');
+  if (data.error) {
+    out.innerHTML = `<div class="error">${data.error}</div>`;
+  } else {
+    out.innerHTML = `<div class="pred"><div class="big">${data.result}</div><div>from ${data.expression}</div></div>`;
+  }
+  await refreshExpressionDisplay();
+});
+--css--
+:root {
+  --bg: #ffffff;
+  --fg: #111827;
+  --muted: #6b7280;
+  --card: #f9fafb;
+  --accent: #2563eb;
+  --accent-contrast: #ffffff;
+  --border: #e5e7eb;
+}
+:root[data-theme="dark"] {
+  --bg: #0b0f19;
+  --fg: #e5e7eb;
+  --muted: #9ca3af;
+  --card: #111827;
+  --accent: #60a5fa;
+  --accent-contrast: #0b0f19;
+  --border: #1f2937;
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+header, footer {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 16px 20px;
+}
+header { display:flex; align-items:center; justify-content:space-between; }
+h1 { margin:0; font-size:1.4rem; }
+h2 { margin:0 0 12px; }
+.hint { margin: 6px 0 12px; color: var(--muted); }
+
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 8px 20px 40px;
+  display: grid;
+  gap: 16px;
+  grid-template-columns: 1fr 1fr;
+}
+@media (max-width: 960px){ main{ grid-template-columns:1fr; } }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 16px;
+  box-shadow: 0 2px 10px rgb(0 0 0 / 6%);
+}
+
+.canvas-row { display:flex; gap:16px; align-items:flex-start; }
+canvas {
+  border: 2px dashed var(--border);
+  border-radius: 12px;
+  background: #ffffff;
+  width: 280px; height: 280px;
+  touch-action: none;
+}
+
+.canvas-buttons { display:flex; flex-direction:column; gap:8px; }
+.row { display:flex; gap:12px; align-items:center; }
+small { font-size: 0.85rem; color: var(--muted); }
+
+button {
+  appearance: none; border: none;
+  background: var(--accent); color: var(--accent-contrast);
+  padding: 8px 12px; border-radius: 10px; font-weight: 600; cursor: pointer;
+}
+button[disabled]{ opacity: .6; cursor: default; }
+
+input[type="number"]{
+  width: 120px; padding: 6px 8px; border-radius: 8px; border:1px solid var(--border);
+  background: var(--bg); color: var(--fg);
+}
+input[type="file"]{ display:block; margin:8px 0 10px; }
+
+.result .big{ font-size: 40px; font-weight: 800; margin-bottom: 6px; }
+.pred{
+  background: rgba(0,0,0,0.04); padding:10px; border-radius:12px; border:1px solid var(--border);
+}
+:root[data-theme="dark"] .pred { background: rgba(255,255,255,0.05); }
+
+.grid {
+  display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+}
+.grid-item{
+  display:grid; grid-template-columns: 90px 1fr; gap:10px;
+  background: var(--bg); border:1px solid var(--border);
+  border-radius:12px; padding:10px;
+}
+.thumb{ position: relative; width:90px; height:90px; border-radius:8px; overflow:hidden; display:flex; align-items:center; justify-content:center; background:#fff; border:1px dashed var(--border); }
+.thumb img{ max-width:100%; max-height:100%; }
+.meta .fn{ font-weight:600; margin-bottom:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.predline{ color: var(--muted); }
+
+/* Delete button overlay on each saved thumbnail */
+.thumb .delete-overlay {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: rgba(239,68,68,0.95);
+  border: none;
+  color: white;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  font-size:14px;
+  cursor: pointer;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.25);
+}
+.thumb .delete-overlay:hover { transform: translateY(-1px); }
+
+/* Modal delete button */
+.modal-meta { display:flex; gap:8px; justify-content:center; margin-top:8px; }
+.delete-btn {
+  background: #ef4444;
+  color: #fff;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+}
+.delete-btn:hover { opacity: 0.95; }
+
+.error{
+  color:#ef4444; font-weight:600; padding:8px 10px;
+  background: rgba(239,68,68,0.08); border:1px solid rgba(239,68,68,0.2); border-radius:10px;
+}
+
+/* Modal */
+.modal { position: fixed; inset: 0; display:flex; align-items:center; justify-content:center; background: rgba(0,0,0,0.5); z-index: 2000; }
+.modal.hidden { display: none; }
+.modal-content {
+  background: var(--card); padding: 12px; border-radius: 12px; max-width: 90vw; max-height: 90vh; overflow: auto;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+  position: relative;
+}
+.modal img { max-width: 80vw; max-height: 70vh; display:block; margin: 0 auto; }
+.modal-close { position:absolute; right:8px; top:8px; background:transparent; border:none; font-size:18px; cursor:pointer; }
+
+/* Theme switcher */
+.switch { position: relative; display: inline-block; width: 52px; height: 28px; }
+.switch input { display:none; }
+.slider { position: absolute; cursor: pointer; inset:0; background:#ccc; transition:.2s; border-radius:28px; }
+.slider:before { content:""; position:absolute; height:22px; width:22px; left:3px; bottom:3px; background:#fff; transition:.2s; border-radius:50%; }
+input:checked + .slider { background: var(--accent); }
+input:checked + .slider:before { transform: translateX(24px); }
+--app--
+
+import os
+import io
+import base64
+import ast
+import operator as op
+import numpy as np
+import cv2
+from PIL import Image, ImageOps, ImageFilter
+from flask import Flask, render_template, request, jsonify, session, send_from_directory
+from werkzeug.utils import secure_filename
+
+import tensorflow as tf
+from tensorflow.keras import models
+
+# -----------------------------
+# Config
+# -----------------------------
+MODEL_PATH = "trained_model.h5"   # change if needed
+DEFAULT_THRESHOLD = 0.70
+APPLY_SMOOTHING = True            # server-side smoothing (Gaussian blur) to help handwriting
+UPLOAD_DIR = "uploads"
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+app = Flask(__name__)
+app.secret_key = "CHANGE_THIS_TO_A_RANDOM_SECRET"  # <<-- replace with secure random value for production
+
+# -----------------------------
+# Load model (prediction-only)
+# -----------------------------
+model = None
+model_load_error = None
+
+def try_load_model(path):
+    global model, model_load_error
+    if not os.path.exists(path):
+        model_load_error = f"Model file not found at '{path}'. Please place a trained model there."
+        print("[WARN]", model_load_error)
+        model = None
+        return
+
+    try:
+        model = models.load_model(path, compile=False)
+        model_load_error = None
+        print(f"[INFO] Loaded model from {path}")
+    except Exception as e:
+        model = None
+        model_load_error = f"Failed to load model: {e}"
+        print("[ERROR]", model_load_error)
+
+try_load_model(MODEL_PATH)
+
+
+# -----------------------------
+# Preprocessing utilities
+# -----------------------------
+def center_and_resize_to_28(img_L_inverted: Image.Image) -> Image.Image:
+    arr = np.array(img_L_inverted)
+    rows = np.where(arr.max(axis=1) > 0)[0]
+    cols = np.where(arr.max(axis=0) > 0)[0]
+
+    if rows.size and cols.size:
+        r0, r1 = rows[0], rows[-1] + 1
+        c0, c1 = cols[0], cols[-1] + 1
+        arr = arr[r0:r1, c0:c1]
+
+    if arr.size == 0:
+        return Image.new('L', (28, 28), 0)
+
+    h, w = arr.shape
+    if h > w:
+        new_h, new_w = 20, max(1, int(round(20 * w / h)))
+    else:
+        new_w, new_h = 20, max(1, int(round(20 * h / w)))
+
+    digit = Image.fromarray(arr).resize((new_w, new_h), Image.LANCZOS)
+    canvas = Image.new('L', (28, 28), 0)
+    left = (28 - new_w) // 2
+    top = (28 - new_h) // 2
+    canvas.paste(digit, (left, top))
+    return canvas
+
+def preprocess_pil_to_tensor(img: Image.Image, apply_smoothing: bool = True) -> np.ndarray:
+    """
+    Convert PIL image to MNIST-like tensor:
+      - grayscale
+      - optional smoothing (Gaussian blur) to reduce stroke noise
+      - invert (white digit on black)
+      - center+resize to 28x28
+      - normalize and reshape to (1,28,28,1)
+    """
+    img = img.convert("L")
+    if apply_smoothing:
+        # small blur helps thin strokes and reduces jitter
+        img = img.filter(ImageFilter.GaussianBlur(radius=0.9))
+    img = ImageOps.invert(img)
+    img = center_and_resize_to_28(img)
+    arr = np.array(img).astype("float32") / 255.0
+    arr = arr.reshape(1, 28, 28, 1)
+    return arr
+
+def predict_with_confidence_pil(img: Image.Image, threshold: float, smoothing: bool):
+    if model is None:
+        raise RuntimeError(model_load_error or "Model not loaded.")
+    tensor = preprocess_pil_to_tensor(img, apply_smoothing=smoothing)
+    probs = model.predict(tensor, verbose=0)[0]
+    label = int(np.argmax(probs))
+    conf = float(np.max(probs))
+    is_sure = conf >= threshold
+    return label, conf, is_sure, probs.tolist()
+
+
+# -----------------------------
+# Safe eval (AST-based)
+# -----------------------------
+# Allowed operators and mapping
+ALLOWED_OPERATORS = {
+    ast.Add: op.add,
+    ast.Sub: op.sub,
+    ast.Mult: op.mul,
+    ast.Div: op.truediv,
+    ast.Pow: op.pow,
+    ast.Mod: op.mod,
+    ast.USub: op.neg,
+    ast.UAdd: op.pos,
+}
+
+def safe_eval(node):
+    """
+    Evaluate an AST node safely supporting numbers, binary ops and parentheses.
+    """
+    if isinstance(node, ast.Expression):
+        return safe_eval(node.body)
+    if isinstance(node, ast.Num):  # Python <3.8
+        return node.n
+    if hasattr(ast, "Constant") and isinstance(node, ast.Constant):  # Python 3.8+
+        if isinstance(node.value, (int, float)):
+            return node.value
+        raise ValueError("Unsupported constant type")
+    if isinstance(node, ast.BinOp):
+        left = safe_eval(node.left)
+        right = safe_eval(node.right)
+        op_type = type(node.op)
+        if op_type in ALLOWED_OPERATORS:
+            return ALLOWED_OPERATORS[op_type](left, right)
+        raise ValueError(f"Unsupported operator {op_type}")
+    if isinstance(node, ast.UnaryOp):
+        operand = safe_eval(node.operand)
+        op_type = type(node.op)
+        if op_type in ALLOWED_OPERATORS:
+            return ALLOWED_OPERATORS[op_type](operand)
+        raise ValueError(f"Unsupported unary operator {op_type}")
+    raise ValueError(f"Unsupported expression: {type(node)}")
+
+def evaluate_expression_safely(expr: str):
+    """
+    Evaluate expression string after minor normalization:
+      - Replace unicode multiplication/division signs if present
+      - Ensure only allowed characters appear (digits, operators, parentheses, dot, spaces)
+    """
+    if expr is None:
+        raise ValueError("Empty expression")
+    # normalize display operators to python ones
+    expr = expr.replace("×", "*").replace("÷", "/").replace("^", "**")
+    allowed_chars = "0123456789.+-*/()% "
+    # quick check: after replacing '**' keep allowed
+    tmp = expr.replace("**", "")  # temporarily remove power token for check
+    if not all(ch in allowed_chars for ch in tmp):
+        raise ValueError("Invalid characters in expression")
+    # parse and evaluate using ast
+    parsed = ast.parse(expr, mode='eval')
+    return safe_eval(parsed)
+
+
+# -----------------------------
+# Digit segmentation (for /predict)
+# -----------------------------
+def segment_digits(image):
+    """
+    Takes a binary canvas image and segments into individual digits.
+    Returns list of digit images (28x28).
+    """
+    # Convert to grayscale - support RGBA/BGR etc
+    if image.shape[2] == 4:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGBA2GRAY)
+    else:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    
+    # Threshold
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # Find contours (each digit)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    digit_imgs = []
+    boxes = []
+    
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w*h > 100:  # ignore tiny noise
+            boxes.append((x, y, w, h))
+    
+    # Sort left-to-right
+    boxes = sorted(boxes, key=lambda b: b[0])
+    
+    for (x, y, w, h) in boxes:
+        digit = thresh[y:y+h, x:x+w]
+        # Pad to square
+        pad = abs(h - w) // 2
+        if h > w:
+            digit = cv2.copyMakeBorder(digit, 0, 0, pad, pad, cv2.BORDER_CONSTANT, value=0)
+        else:
+            digit = cv2.copyMakeBorder(digit, pad, pad, 0, 0, cv2.BORDER_CONSTANT, value=0)
+        
+        # Resize to MNIST format
+        digit = cv2.resize(digit, (28, 28), interpolation=cv2.INTER_AREA)
+        digit = digit.astype("float32") / 255.0
+        digit = np.expand_dims(digit, axis=(0, -1))  # (1, 28, 28, 1)
+        
+        digit_imgs.append(digit)
+    
+    return digit_imgs
+
+
+# -----------------------------
+# Routes
+# -----------------------------
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/model_status", methods=["GET"])
+def model_status():
+    if model is None:
+        return jsonify({"loaded": False, "error": model_load_error})
+    return jsonify({"loaded": True, "model_path": MODEL_PATH})
+
+
+@app.route("/predict_draw", methods=["POST"])
+def predict_draw():
+    """
+    Body JSON: { image: "data:image/png;base64,...", threshold: 0.7?, smoothing: true|false? }
+    """
+    try:
+        if model is None:
+            return jsonify({"error": model_load_error or "Model is not loaded."}), 400
+
+        data = request.get_json(force=True)
+        data_url = data.get("image")
+        threshold = float(data.get("threshold", DEFAULT_THRESHOLD))
+        smoothing = bool(data.get("smoothing", APPLY_SMOOTHING))
+
+        header, b64data = data_url.split(",", 1)
+        img_bytes = base64.b64decode(b64data)
+        img = Image.open(io.BytesIO(img_bytes))
+
+        label, conf, is_sure, probs = predict_with_confidence_pil(img, threshold, smoothing)
+        return jsonify({
+            "digit": None if not is_sure else label,
+            "raw_digit": label,
+            "confidence": conf,
+            "is_sure": is_sure,
+            "probs": probs
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/predict_files", methods=["POST"])
+def predict_files():
+    try:
+        if model is None:
+            return jsonify({"error": model_load_error or "Model not loaded."}), 400
+
+        threshold = float(request.form.get("threshold", DEFAULT_THRESHOLD))
+        smoothing = request.form.get("smoothing", str(APPLY_SMOOTHING)).lower() in ("1","true","yes")
+        files = request.files.getlist("files")
+        results = []
+        for f in files:
+            img = Image.open(f.stream)
+            label, conf, is_sure, probs = predict_with_confidence_pil(img, threshold, smoothing)
+            results.append({
+                "filename": f.filename,
+                "digit": None if not is_sure else label,
+                "raw_digit": label,
+                "confidence": conf,
+                "is_sure": is_sure,
+                "probs": probs
+            })
+        return jsonify({"results": results})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+# New: predict + append (atomic)
+@app.route("/predict_and_append", methods=["POST"])
+def predict_and_append():
+    """
+    Accepts same body as predict_draw; if digit predicted confidently, append to session expression.
+    Returns the prediction and updated expression.
+    """
+    try:
+        if model is None:
+            return jsonify({"error": model_load_error or "Model not loaded."}), 400
+
+        data = request.get_json(force=True)
+        data_url = data.get("image")
+        threshold = float(data.get("threshold", DEFAULT_THRESHOLD))
+        smoothing = bool(data.get("smoothing", APPLY_SMOOTHING))
+
+        header, b64data = data_url.split(",", 1)
+        img_bytes = base64.b64decode(b64data)
+        img = Image.open(io.BytesIO(img_bytes))
+
+        label, conf, is_sure, probs = predict_with_confidence_pil(img, threshold, smoothing)
+
+        # ensure session key exists
+        expr = session.get("expression", "")
+        appended = False
+        if is_sure:
+            expr = expr + str(label)
+            session["expression"] = expr
+            appended = True
+
+        return jsonify({
+            "digit": None if not is_sure else label,
+            "raw_digit": label,
+            "confidence": conf,
+            "is_sure": is_sure,
+            "probs": probs,
+            "appended": appended,
+            "expression": expr
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+# Append symbol (operators or digits) via API (centralized)
+@app.route("/append_symbol", methods=["POST"])
+def append_symbol():
+    try:
+        data = request.get_json(force=True)
+        symbol = data.get("symbol", "")
+        if not isinstance(symbol, str) or not symbol:
+            return jsonify({"error": "Missing symbol"}), 400
+
+        # normalize common display operators
+        symbol = symbol.replace("×", "*").replace("÷", "/").replace("^", "**")
+
+        # one more validation: only allow small set of tokens
+        allowed = set("0123456789+-*/()%. ")
+        test = symbol.replace("**", "")  # remove power token before checking allowed chars
+        if not all(ch in allowed for ch in test):
+            return jsonify({"error": "Invalid symbol"}), 400
+
+        expr = session.get("expression", "")
+        expr = expr + symbol
+        session["expression"] = expr
+        return jsonify({"expression": expr})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/clear_expression", methods=["POST"])
+def clear_expression():
+    try:
+        session["expression"] = ""
+        return jsonify({"expression": ""})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/get_expression", methods=["GET"])
+def get_expression():
+    try:
+        expr = session.get("expression", "")
+        return jsonify({"expression": expr})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/evaluate_expression", methods=["POST"])
+def evaluate_expression():
+    try:
+        # Check if an expression was supplied in the body, otherwise use session one
+        data = request.get_json(force=True) if request.data else {}
+        expr = data.get("expression", None)
+        if expr is None:
+            expr = session.get("expression", "")
+
+        # evaluate safely
+        result = evaluate_expression_safely(expr)
+        # optionally clear expression or keep it — we keep it (client can clear explicitly)
+        return jsonify({"expression": expr, "result": result})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@app.route("/predict", methods=["POST"])
+def predict():
+    file = request.files['file'].read()
+    npimg = np.frombuffer(file, np.uint8)
+    img = cv2.imdecode(npimg, cv2.IMREAD_UNCHANGED)
+    
+    # Segment digits
+    digits = segment_digits(img)
+    preds = []
+    
+    for d in digits:
+        prediction = model.predict(d)
+        preds.append(str(np.argmax(prediction)))
+    
+    result = "".join(preds)  # e.g., "123"
+    
+    return jsonify({"prediction": result})
+
+
+# -----------------------------
+# File management (uploads)
+# -----------------------------
+@app.route("/upload", methods=["POST"])
+def upload_file():
+    """
+    Accepts multipart form uploads.
+    Returns: { files: [ { filename, size }, ... ] }
+    """
+    if not request.files:
+        return jsonify({"error": "No files uploaded"}), 400
+
+    saved = []
+    # accept any file field
+    for key in request.files:
+        for f in request.files.getlist(key):
+            if f and f.filename:
+                filename = secure_filename(f.filename)
+                # make unique if exists
+                dest = os.path.join(UPLOAD_DIR, filename)
+                base, ext = os.path.splitext(filename)
+                counter = 1
+                while os.path.exists(dest):
+                    filename = f"{base}_{counter}{ext}"
+                    dest = os.path.join(UPLOAD_DIR, filename)
+                    counter += 1
+                f.save(dest)
+                saved.append({"filename": filename, "size": os.path.getsize(dest)})
+    return jsonify({"files": saved})
+
+
+@app.route("/list_uploads", methods=["GET"])
+def list_uploads():
+    files = []
+    for fname in sorted(os.listdir(UPLOAD_DIR), reverse=True):
+        fpath = os.path.join(UPLOAD_DIR, fname)
+        if os.path.isfile(fpath):
+            files.append({"filename": fname, "size": os.path.getsize(fpath)})
+    return jsonify({"files": files})
+
+
+@app.route("/delete_file/<path:filename>", methods=["DELETE"])
+def delete_file(filename):
+    # secure the filename to avoid traversal attacks
+    filename = secure_filename(filename)
+    filepath = os.path.join(UPLOAD_DIR, filename)
+    if os.path.exists(filepath) and os.path.isfile(filepath):
+        os.remove(filepath)
+        return jsonify({"success": True})
+    return jsonify({"error": "File not found"}), 404
+
+
+@app.route("/uploads/<path:filename>")
+def serve_file(filename):
+    # security: send only from UPLOAD_DIR
+    return send_from_directory(UPLOAD_DIR, filename)
+
+
+# -----------------------------
+if __name__ == "__main__":
+    print("[INFO] Starting Flask app (prediction-only).")
+    app.run(debug=True)
